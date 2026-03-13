@@ -14,6 +14,7 @@ Usage:
     search_query = preprocess_for_search("ค้นหาเกี่ยวกับ machine learning")
 """
 
+import threading
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 
@@ -25,6 +26,9 @@ from .router import (
     get_router,
     detect_language,
 )
+
+# Security: Maximum text length to prevent memory exhaustion
+MAX_TEXT_LENGTH = 100_000  # 100KB limit
 
 
 @dataclass
@@ -98,6 +102,10 @@ class TextPreprocessor:
                 was_normalized=False,
                 was_spellchecked=False,
             )
+
+        # Security: Truncate very long texts to prevent memory exhaustion
+        if len(text) > MAX_TEXT_LENGTH:
+            text = text[:MAX_TEXT_LENGTH]
 
         # Detect language
         detection = self._router.detect(text)
@@ -219,15 +227,18 @@ class TextPreprocessor:
         return self._router.preprocess_for_search(text)
 
 
-# Singleton instance
+# Singleton instance with thread safety
 _preprocessor: Optional[TextPreprocessor] = None
+_preprocessor_lock = threading.Lock()
 
 
 def get_preprocessor() -> TextPreprocessor:
-    """Get singleton TextPreprocessor instance."""
+    """Get singleton TextPreprocessor instance (thread-safe)."""
     global _preprocessor
     if _preprocessor is None:
-        _preprocessor = TextPreprocessor()
+        with _preprocessor_lock:
+            if _preprocessor is None:  # Double-check pattern
+                _preprocessor = TextPreprocessor()
     return _preprocessor
 
 

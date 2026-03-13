@@ -16,6 +16,7 @@ Usage:
 """
 
 import re
+import threading
 from typing import Dict, List, Optional, Tuple, Any, Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -331,15 +332,18 @@ class LanguageRouter:
         return [t for t in tokens if t.lower() not in english_stopwords]
 
 
-# Singleton instance
+# Singleton instance with thread safety
 _router: Optional[LanguageRouter] = None
+_router_lock = threading.Lock()
 
 
 def get_router() -> LanguageRouter:
-    """Get singleton LanguageRouter instance."""
+    """Get singleton LanguageRouter instance (thread-safe)."""
     global _router
     if _router is None:
-        _router = LanguageRouter()
+        with _router_lock:
+            if _router is None:  # Double-check pattern
+                _router = LanguageRouter()
     return _router
 
 
