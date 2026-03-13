@@ -6,7 +6,7 @@ Five-Layer Memory Model + Graph Schema
 
 from enum import Enum
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
 
@@ -30,7 +30,11 @@ class MemoryLayer(str, Enum):
 
 
 class DecayConfig:
-    """Decay configuration for each layer"""
+    """
+    Decay configuration for each layer.
+
+    SINGLE SOURCE OF TRUTH - import from here, do not duplicate.
+    """
 
     # Lambda values for exponential decay
     LAMBDA_DEFAULT = 0.01  # Half-life ~69 days
@@ -43,14 +47,28 @@ class DecayConfig:
     # Decay threshold for forgetting
     DECAY_THRESHOLD = 0.1  # Below this = forget
 
-    # Decay multipliers per layer
+    # Access factor constants
+    ACCESS_BASE = 0.5
+    ACCESS_INCREMENT = 0.05
+    ACCESS_MAX_COUNT = 10  # 10+ accesses = max factor
+
+    # Decay multipliers per layer (applied to lambda)
     LAYER_MULTIPLIERS = {
-        MemoryLayer.USER_MODEL: 1.0,  # Never decay
+        MemoryLayer.USER_MODEL: 0.0,  # Never decay
         MemoryLayer.PROCEDURAL: 0.5,  # Half the decay rate
         MemoryLayer.SEMANTIC: 1.0,  # Normal decay
-        MemoryLayer.EPISODIC: 1.0,  # TTL-based, not decay
+        MemoryLayer.EPISODIC: 0.0,  # TTL-based, not decay
         MemoryLayer.WORKING: 0.0,  # Session only
     }
+
+    # TTL constants (days)
+    TTL_EPISODIC_DEFAULT_DAYS = 90
+    TTL_EPISODIC_MAX_EXTENSION = 30  # Max extra days from access
+
+
+def utcnow() -> datetime:
+    """Get current UTC time (timezone-aware)."""
+    return datetime.now(timezone.utc)
 
 
 class EntityType(str, Enum):
@@ -114,9 +132,9 @@ class SynapseNode(BaseModel):
     decay_score: float = Field(1.0, ge=0.0, le=1.0, description="Decay score")
     access_count: int = Field(0, ge=0, description="Access count")
 
-    # Timestamps
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    # Timestamps (timezone-aware UTC)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
     expires_at: Optional[datetime] = Field(None, description="TTL expiration")
 
     # Provenance
@@ -137,7 +155,7 @@ class SynapseEdge(BaseModel):
 
     # Temporal validity
     valid_at: datetime = Field(
-        default_factory=datetime.utcnow, description="When it became true"
+        default_factory=utcnow, description="When it became true"
     )
     invalid_at: Optional[datetime] = Field(
         None, description="When it became false (null = still true)"
@@ -169,7 +187,7 @@ class SynapseEpisode(BaseModel):
     memory_layer: MemoryLayer = Field(MemoryLayer.EPISODIC)
 
     # Timestamps
-    recorded_at: datetime = Field(default_factory=datetime.utcnow)
+    recorded_at: datetime = Field(default_factory=utcnow)
     expires_at: Optional[datetime] = Field(None, description="TTL expiration")
 
     # User context
@@ -201,7 +219,7 @@ class UserModel(BaseModel):
     notes: List[str] = Field(default_factory=list, description="Free-form notes")
 
     # Timestamps
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
 
 
 class ProceduralMemory(BaseModel):

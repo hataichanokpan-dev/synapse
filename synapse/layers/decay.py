@@ -10,25 +10,10 @@ access_factor = min(1.0, 0.5 + access_count × 0.05)
 """
 
 import math
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List
 
-from synapse.layers.types import MemoryLayer
-
-
-class DecayConfig:
-    """Decay configuration constants"""
-
-    # Lambda values for exponential decay
-    LAMBDA_DEFAULT = 0.01  # Half-life ~69 days
-    LAMBDA_PROCEDURAL = 0.005  # Half-life ~139 days
-
-    # TTL for episodic memory
-    TTL_EPISODIC_DAYS = 90
-    TTL_EXTEND_DAYS = 30
-
-    # Decay threshold
-    DECAY_THRESHOLD = 0.1
+from .types import MemoryLayer, DecayConfig, utcnow
 
 
 def compute_decay_score(
@@ -41,16 +26,19 @@ def compute_decay_score(
     Compute decay score for a memory node.
 
     Args:
-        updated_at: When the node was last updated
-        access_count: Number of times accessed
+        updated_at: When the node was last updated (timezone-aware UTC)
+        access_count: Number of times accessed (will be clamped to >= 0)
         memory_layer: Which memory layer the node belongs to
-        now: Current time (default: datetime.utcnow())
+        now: Current time (default: utcnow())
 
     Returns:
         Decay score between 0.0 and 1.0
     """
     if now is None:
-        now = datetime.utcnow()
+        now = utcnow()
+
+    # Clamp access_count to prevent negative impact
+    access_count = max(0, access_count)
 
     # Layer 1 (user_model) never decays
     if memory_layer == MemoryLayer.USER_MODEL:
@@ -64,8 +52,9 @@ def compute_decay_score(
     if memory_layer == MemoryLayer.EPISODIC:
         return 1.0  # TTL handled separately
 
-    # Calculate days since update
-    days_since = max(0, (now - updated_at).days)
+    # Calculate fractional days since update (more precise than integer)
+    delta = now - updated_at
+    days_since = max(0.0, delta.total_seconds() / 86400.0)
 
     # Pick λ based on layer
     if memory_layer == MemoryLayer.PROCEDURAL:
@@ -73,12 +62,19 @@ def compute_decay_score(
     else:
         lambda_val = DecayConfig.LAMBDA_DEFAULT
 
+    # Apply layer multiplier
+    multiplier = DecayConfig.LAYER_MULTIPLIERS.get(memory_layer, 1.0)
+    effective_lambda = lambda_val * multiplier
+
     # Recency factor: e^(-λ × days)
-    recency_factor = math.exp(-lambda_val * days_since)
+    recency_factor = math.exp(-effective_lambda * days_since)
 
     # Access factor: min(1.0, 0.5 + count × 0.05)
     # 10+ accesses = max factor
-    access_factor = min(1.0, 0.5 + access_count * 0.05)
+    access_factor = min(
+        1.0,
+        DecayConfig.ACCESS_BASE + access_count * DecayConfig.ACCESS_INCREMENT,
+    )
 
     # Combined score
     score = recency_factor * access_factor
@@ -96,7 +92,7 @@ def compute_ttl(
 
     Args:
         memory_layer: Memory layer
-        created_at: Creation timestamp
+        created_at: Creation timestamp (timezone-aware)
         access_count: Number of accesses
 
     Returns:
@@ -109,7 +105,7 @@ def compute_ttl(
     base_days = DecayConfig.TTL_EPISODIC_DAYS
 
     # Extend based on access: +1 day per access (max 30 extra)
-    extra_days = min(30, access_count)
+    extra_days = min(30, max(0, access_count))
 
     return created_at + timedelta(days=base_days + extra_days)
 
@@ -117,6 +113,7 @@ def compute_ttl(
 def extend_ttl(
     current_expires_at: Optional[datetime],
     now: Optional[datetime] = None,
+    allow_revival: bool = False,
 ) -> Optional[datetime]:
     """
     Extend TTL on access (for episodic memory).
@@ -124,17 +121,26 @@ def extend_ttl(
     Args:
         current_expires_at: Current expiration
         now: Current time
+        allow_revival: If True, can extend even if already expired
+                       If False, return None if already expired
 
     Returns:
-        New expiration or None
+        New expiration or None (if not applicable or not revivable)
     """
     if current_expires_at is None:
         return None
 
     if now is None:
-        now = datetime.utcnow()
+        now = utcnow()
 
-    # Extend by 30 days
+    # BUG FIX: Check if already expired
+    if current_expires_at <= now:
+        if not allow_revival:
+            return None  # Already expired, no revival
+        # If revival allowed, extend from now
+        return now + timedelta(days=DecayConfig.TTL_EXTEND_DAYS)
+
+    # Extend from current expiration
     return current_expires_at + timedelta(days=DecayConfig.TTL_EXTEND_DAYS)
 
 
@@ -142,7 +148,7 @@ def should_forget(
     decay_score: float,
     expires_at: Optional[datetime],
     now: Optional[datetime] = None,
-    threshold: float = 0.1,
+    threshold: Optional[float] = None,
 ) -> bool:
     """
     Determine if memory should be forgotten.
@@ -151,16 +157,19 @@ def should_forget(
         decay_score: Current decay score
         expires_at: TTL expiration
         now: Current time
-        threshold: Decay threshold
+        threshold: Decay threshold (default: from DecayConfig)
 
     Returns:
         True if should forget
     """
     if now is None:
-        now = datetime.utcnow()
+        now = utcnow()
 
-    # TTL expired
-    if expires_at and expires_at < now:
+    if threshold is None:
+        threshold = DecayConfig.DECAY_THRESHOLD
+
+    # TTL expired (use <= for exact expiry)
+    if expires_at is not None and expires_at <= now:
         return True
 
     # Decay below threshold
@@ -170,7 +179,7 @@ def should_forget(
     return False
 
 
-def get_half_life(memory_layer: MemoryLayer) -> float:
+def get_half_life(memory_layer: MemoryLayer) -> Optional[float]:
     """
     Get half-life in days for a memory layer.
 
@@ -180,11 +189,21 @@ def get_half_life(memory_layer: MemoryLayer) -> float:
         memory_layer: Memory layer
 
     Returns:
-        Half-life in days
+        Half-life in days, or None if not applicable (TTL/session-based)
     """
-    if memory_layer == MemoryLayer.USER_MODEL:
-        return float("inf")  # Never decays
+    # TTL-based layers - no decay half-life
+    if memory_layer == MemoryLayer.EPISODIC:
+        return None  # TTL-based, not decay
 
+    # Session-based layers - no decay
+    if memory_layer == MemoryLayer.WORKING:
+        return None  # Session only
+
+    # Never decays
+    if memory_layer == MemoryLayer.USER_MODEL:
+        return float("inf")
+
+    # Decay-based layers
     if memory_layer == MemoryLayer.PROCEDURAL:
         lambda_val = DecayConfig.LAMBDA_PROCEDURAL
     else:
@@ -193,6 +212,70 @@ def get_half_life(memory_layer: MemoryLayer) -> float:
     return math.log(2) / lambda_val
 
 
+def refresh_all_decay_scores(
+    nodes: List[dict],
+    now: Optional[datetime] = None,
+) -> List[dict]:
+    """
+    Refresh decay scores for a batch of nodes.
+
+    Args:
+        nodes: List of node dicts with 'updated_at', 'access_count', 'memory_layer'
+        now: Current time
+
+    Returns:
+        List of nodes with updated 'decay_score' field
+    """
+    if now is None:
+        now = utcnow()
+
+    for node in nodes:
+        updated_at = node.get("updated_at")
+        access_count = node.get("access_count", 0)
+        memory_layer = node.get("memory_layer", MemoryLayer.SEMANTIC)
+
+        if updated_at is not None:
+            node["decay_score"] = compute_decay_score(
+                updated_at=updated_at,
+                access_count=access_count,
+                memory_layer=memory_layer,
+                now=now,
+            )
+
+    return nodes
+
+
+def decay_summary(nodes: List[dict]) -> dict:
+    """
+    Get summary statistics for decay scores.
+
+    Args:
+        nodes: List of nodes with decay_score
+
+    Returns:
+        Summary dict with counts and averages
+    """
+    if not nodes:
+        return {
+            "total": 0,
+            "healthy": 0,
+            "decaying": 0,
+            "forgotten": 0,
+            "avg_score": 0.0,
+        }
+
+    scores = [n.get("decay_score", 1.0) for n in nodes]
+    threshold = DecayConfig.DECAY_THRESHOLD
+
+    return {
+        "total": len(nodes),
+        "healthy": sum(1 for s in scores if s >= 0.7),
+        "decaying": sum(1 for s in scores if threshold <= s < 0.7),
+        "forgotten": sum(1 for s in scores if s < threshold),
+        "avg_score": round(sum(scores) / len(scores), 4),
+    }
+
+
 # Half-lives for reference:
-# λ = 0.01  → half-life ≈ 69 days
-# λ = 0.005 → half-life ≈ 139 days
+# λ = 0.01  → half-life ≈ 69.3 days
+# λ = 0.005 → half-life ≈ 138.6 days
