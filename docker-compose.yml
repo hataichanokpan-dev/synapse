@@ -1,0 +1,65 @@
+# Synapse Docker Compose
+# Knowledge Graph + Vector DB + Thai NLP
+
+services:
+  # FalkorDB - Graph Database (Redis-based)
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: synapse-falkordb
+    ports:
+      - "6379:6379"
+    volumes:
+      - falkordb_data:/data
+    environment:
+      - FALKORDB_ARGS=--save 60 1
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ChromaDB - Vector Database
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: synapse-chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_AUTH_CREDENTIALS=${CHROMA_AUTH_TOKEN:-synapse}
+      - CHROMA_SERVER_AUTH_CREDENTIALS_PROVIDER=chromadb.auth.token.TokenAuthServerProviderCredentials
+      - CHROMA_SERVER_AUTH_PROVIDER=chromadb.auth.token.TokenAuthenticationServerProvider
+      - CHROMA_SERVER_AUTH_TOKEN_TRANSPORT_HEADER=X-Chroma-Token
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Synapse MCP Server
+  synapse:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: synapse-server
+    ports:
+      - "47780:47780"
+    environment:
+      - FALKORDB_URI=redis://falkordb:6379
+      - CHROMA_URI=http://chromadb:8000
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - CHROMA_AUTH_TOKEN=${CHROMA_AUTH_TOKEN:-synapse}
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  falkordb_data:
+  chromadb_data:
