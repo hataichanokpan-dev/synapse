@@ -10,6 +10,10 @@ Storage:
 
 Episodic memories have a Time-To-Live (TTL) instead of decay scoring.
 Access extends TTL by 30 days (max 30 extra days from access count).
+
+Thai NLP Integration:
+- Content and summaries are tokenized for FTS5
+- Search queries are preprocessed for Thai
 """
 
 import json
@@ -22,6 +26,21 @@ from datetime import datetime, timedelta
 
 from .types import SynapseEpisode, MemoryLayer, utcnow
 from .decay import compute_ttl, extend_ttl, should_forget, DecayConfig
+
+# Lazy import for Thai NLP
+_nlp_preprocessor = None
+
+
+def _get_nlp_preprocessor():
+    """Get NLP preprocessor (lazy import)."""
+    global _nlp_preprocessor
+    if _nlp_preprocessor is None:
+        try:
+            from synapse.nlp.preprocess import get_preprocessor
+            _nlp_preprocessor = get_preprocessor()
+        except ImportError:
+            _nlp_preprocessor = False  # Mark as unavailable
+    return _nlp_preprocessor if _nlp_preprocessor else None
 
 
 # Default database path
@@ -55,7 +74,9 @@ class EpisodicManager:
                 CREATE TABLE IF NOT EXISTS episodes (
                     id TEXT PRIMARY KEY,
                     content TEXT NOT NULL,
+                    content_fts TEXT,
                     summary TEXT,
+                    summary_fts TEXT,
                     topics TEXT DEFAULT '[]',
                     outcome TEXT DEFAULT 'unknown',
                     memory_layer TEXT DEFAULT 'episodic',
@@ -78,6 +99,22 @@ class EpisodicManager:
                 CREATE INDEX IF NOT EXISTS idx_episodes_topics
                 ON episodes(topics)
             """)
+
+            # FTS5 for full-text search (using tokenized content/summary)
+            conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts
+                USING fts5(content_fts, summary_fts, content='episodes', content_rowid='rowid')
+            """)
+
+            # Migration: Add FTS columns if not exists
+            try:
+                conn.execute("ALTER TABLE episodes ADD COLUMN content_fts TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE episodes ADD COLUMN summary_fts TEXT")
+            except sqlite3.OperationalError:
+                pass
 
             # FTS5 for full-text search on summaries
             conn.execute("""
@@ -108,6 +145,7 @@ class EpisodicManager:
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
         ttl_days: Optional[int] = None,
+        preprocess: bool = True,
     ) -> SynapseEpisode:
         """
         Record a new episode.
@@ -120,6 +158,7 @@ class EpisodicManager:
             user_id: User identifier
             session_id: Session identifier
             ttl_days: Custom TTL (default: 90 days + access-based extension)
+            preprocess: Apply Thai NLP tokenization for FTS
 
         Returns:
             Created SynapseEpisode
@@ -136,6 +175,16 @@ class EpisodicManager:
             )
         else:
             expires_at = now + timedelta(days=ttl_days)
+
+        # Tokenize content and summary for FTS5 (especially for Thai)
+        content_fts = content
+        summary_fts = summary
+        if preprocess:
+            preprocessor = _get_nlp_preprocessor()
+            if preprocessor:
+                content_fts = preprocessor.tokenize_for_fts(content)
+                if summary:
+                    summary_fts = preprocessor.tokenize_for_fts(summary)
 
         episode = SynapseEpisode(
             id=episode_id,
@@ -154,14 +203,16 @@ class EpisodicManager:
             conn.execute(
                 """
                 INSERT INTO episodes (
-                    id, content, summary, topics, outcome, memory_layer,
+                    id, content, content_fts, summary, summary_fts, topics, outcome, memory_layer,
                     recorded_at, expires_at, user_id, session_id, access_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
                     episode_id,
                     content,
+                    content_fts,
                     summary,
+                    summary_fts,
                     json.dumps(topics or []),
                     outcome,
                     MemoryLayer.EPISODIC.value,
@@ -231,11 +282,13 @@ class EpisodicManager:
         user_id: Optional[str] = None,
         limit: int = 10,
         include_expired: bool = False,
+        preprocess: bool = True,
     ) -> List[SynapseEpisode]:
         """
         Find episodes matching criteria.
 
         Uses FTS5 for full-text search on summaries.
+        Thai queries are tokenized for better FTS5 matching.
 
         Args:
             query: Full-text search query
@@ -244,6 +297,7 @@ class EpisodicManager:
             user_id: Filter by user
             limit: Maximum results
             include_expired: Include expired episodes
+            preprocess: Apply Thai NLP preprocessing
 
         Returns:
             List of SynapseEpisode
@@ -251,35 +305,111 @@ class EpisodicManager:
         episodes = []
         now = utcnow()
 
+        # Preprocess query for Thai
+        search_query = query
+        if query and preprocess:
+            preprocessor = _get_nlp_preprocessor()
+            if preprocessor:
+                search_query = preprocessor.tokenize_for_fts(query)
+
         with self._get_connection() as conn:
             # Build query
-            sql = "SELECT * FROM episodes WHERE 1=1"
-            params = []
+            if search_query:
+                # Use FTS5 for full-text search
+                try:
+                    sql = """
+                        SELECT e.* FROM episodes e
+                        JOIN episodes_fts fts ON e.rowid = fts.rowid
+                        WHERE episodes_fts MATCH ?
+                    """
+                    params = [search_query]
 
-            if not include_expired:
-                sql += " AND (expires_at IS NULL OR expires_at > ?)"
-                params.append(now.isoformat())
+                    if not include_expired:
+                        sql += " AND (e.expires_at IS NULL OR e.expires_at > ?)"
+                        params.append(now.isoformat())
 
-            if outcome:
-                sql += " AND outcome = ?"
-                params.append(outcome)
+                    if outcome:
+                        sql += " AND e.outcome = ?"
+                        params.append(outcome)
 
-            if user_id:
-                sql += " AND user_id = ?"
-                params.append(user_id)
+                    if user_id:
+                        sql += " AND e.user_id = ?"
+                        params.append(user_id)
 
-            # Topic filtering (JSON array contains)
-            if topics:
-                for topic in topics:
-                    sql += " AND topics LIKE ?"
-                    params.append(f'%"{topic}"%')
+                    # Topic filtering (JSON array contains)
+                    if topics:
+                        for topic in topics:
+                            sql += " AND e.topics LIKE ?"
+                            params.append(f'%"{topic}"%')
 
-            sql += " ORDER BY recorded_at DESC LIMIT ?"
-            params.append(limit)
+                    sql += " ORDER BY e.recorded_at DESC LIMIT ?"
+                    params.append(limit)
 
-            cursor = conn.execute(sql, params)
+                    cursor = conn.execute(sql, params)
+                    rows = cursor.fetchall()
 
-            for row in cursor:
+                except sqlite3.OperationalError:
+                    # FTS5 might not have data yet, fallback to LIKE
+                    sql = "SELECT * FROM episodes WHERE 1=1"
+                    params = []
+
+                    if not include_expired:
+                        sql += " AND (expires_at IS NULL OR expires_at > ?)"
+                        params.append(now.isoformat())
+
+                    if outcome:
+                        sql += " AND outcome = ?"
+                        params.append(outcome)
+
+                    if user_id:
+                        sql += " AND user_id = ?"
+                        params.append(user_id)
+
+                    # Content/summary LIKE search
+                    sql += " AND (content LIKE ? OR summary LIKE ?)"
+                    params.extend([f"%{query}%", f"%{query}%"])
+
+                    if topics:
+                        for topic in topics:
+                            sql += " AND topics LIKE ?"
+                            params.append(f'%"{topic}"%')
+
+                    sql += " ORDER BY recorded_at DESC LIMIT ?"
+                    params.append(limit)
+
+                    cursor = conn.execute(sql, params)
+                    rows = cursor.fetchall()
+            else:
+                # No query, just filter
+                sql = "SELECT * FROM episodes WHERE 1=1"
+                params = []
+
+                if not include_expired:
+                    sql += " AND (expires_at IS NULL OR expires_at > ?)"
+                    params.append(now.isoformat())
+
+                if outcome:
+                    sql += " AND outcome = ?"
+                    params.append(outcome)
+
+                if user_id:
+                    sql += " AND user_id = ?"
+                    params.append(user_id)
+
+                # Topic filtering (JSON array contains)
+                if topics:
+                    for topic in topics:
+                        sql += " AND topics LIKE ?"
+                        params.append(f'%"{topic}"%')
+
+                sql += " ORDER BY recorded_at DESC LIMIT ?"
+                params.append(limit)
+
+                cursor = conn.execute(sql, params)
+                rows = cursor.fetchall()
+
+            # Process results
+            for row in rows:
                 episode = SynapseEpisode(
                     id=row["id"],
                     content=row["content"],

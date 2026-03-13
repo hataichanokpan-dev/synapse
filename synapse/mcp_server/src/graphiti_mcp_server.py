@@ -149,6 +149,16 @@ mcp = FastMCP(
     instructions=GRAPHITI_MCP_INSTRUCTIONS,
 )
 
+# Register Thai NLP tools
+try:
+    from thai_nlp_tools import register_thai_nlp_tools
+    register_thai_nlp_tools(mcp)
+    logger.info('Thai NLP tools registered successfully')
+except ImportError as e:
+    logger.warning(f'Thai NLP tools not available: {e}')
+except Exception as e:
+    logger.error(f'Error registering Thai NLP tools: {e}')
+
 # Global services
 graphiti_service: Optional['GraphitiService'] = None
 queue_service: QueueService | None = None

@@ -12,6 +12,7 @@ This layer wraps Graphiti's functionality with:
 - Decay scoring on retrieval
 - Supersede pattern for outdated facts
 - Layer classification for entities
+- Thai NLP preprocessing for better extraction
 """
 
 import asyncio
@@ -28,6 +29,21 @@ from .types import (
     utcnow,
 )
 from .decay import compute_decay_score, should_forget, DecayConfig
+
+# Lazy import for Thai NLP
+_nlp_preprocessor = None
+
+
+def _get_nlp_preprocessor():
+    """Get NLP preprocessor (lazy import)."""
+    global _nlp_preprocessor
+    if _nlp_preprocessor is None:
+        try:
+            from synapse.nlp.preprocess import get_preprocessor
+            _nlp_preprocessor = get_preprocessor()
+        except ImportError:
+            _nlp_preprocessor = False  # Mark as unavailable
+    return _nlp_preprocessor if _nlp_preprocessor else None
 
 
 class SemanticManager:
@@ -70,6 +86,7 @@ class SemanticManager:
         memory_layer: MemoryLayer = MemoryLayer.SEMANTIC,
         confidence: float = 0.7,
         source_episode: Optional[str] = None,
+        preprocess: bool = True,
     ) -> SynapseNode:
         """
         Add an entity to semantic memory.
@@ -81,6 +98,7 @@ class SemanticManager:
             memory_layer: Which memory layer (default: SEMANTIC)
             confidence: Confidence score (0.0 to 1.0)
             source_episode: Source episode ID
+            preprocess: Apply Thai NLP preprocessing
 
         Returns:
             Created SynapseNode
@@ -88,13 +106,31 @@ class SemanticManager:
         await self._ensure_graphiti()
 
         now = utcnow()
-        node_id = f"entity_{name.lower().replace(' ', '_')}_{int(now.timestamp())}"
+
+        # Preprocess name and summary for Thai
+        processed_name = name
+        processed_summary = summary
+        entity_metadata = {}
+
+        if preprocess:
+            preprocessor = _get_nlp_preprocessor()
+            if preprocessor:
+                result = preprocessor.preprocess_for_extraction(name)
+                processed_name = result.processed
+                entity_metadata["original_name"] = name
+                entity_metadata["language"] = result.language
+
+                if summary:
+                    summary_result = preprocessor.preprocess_for_extraction(summary)
+                    processed_summary = summary_result.processed
+
+        node_id = f"entity_{processed_name.lower().replace(' ', '_')}_{int(now.timestamp())}"
 
         node = SynapseNode(
             id=node_id,
             type=entity_type,
-            name=name,
-            summary=summary,
+            name=processed_name,
+            summary=processed_summary,
             memory_layer=memory_layer,
             confidence=confidence,
             decay_score=1.0,  # Fresh node
@@ -163,6 +199,7 @@ class SemanticManager:
         min_score: float = 0.1,
         entity_types: Optional[List[EntityType]] = None,
         use_hybrid: bool = True,
+        preprocess_query: bool = True,
     ) -> List[SearchResult]:
         """
         Search semantic memory.
@@ -173,6 +210,7 @@ class SemanticManager:
             min_score: Minimum decay score threshold
             entity_types: Filter by entity types
             use_hybrid: Use hybrid search (vector + FTS + graph)
+            preprocess_query: Apply Thai NLP preprocessing
 
         Returns:
             List of SearchResult
@@ -182,8 +220,18 @@ class SemanticManager:
         now = utcnow()
         results = []
 
+        # Preprocess query for Thai
+        processed_query = query
+        query_metadata = {}
+
+        if preprocess_query:
+            preprocessor = _get_nlp_preprocessor()
+            if preprocessor:
+                processed_query = preprocessor.preprocess_for_search(query)
+                query_metadata["preprocessed"] = True
+
         # TODO: Implement actual Graphiti search
-        # raw_results = await self._graphiti.search(query, limit=limit * 2)
+        # raw_results = await self._graphiti.search(processed_query, limit=limit * 2)
 
         # For now, return empty list (placeholder)
         # Real implementation will query Graphiti and compute decay scores

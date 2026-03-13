@@ -7,6 +7,10 @@ SLOW DECAY - λ = 0.005, half-life ~139 days
 Storage:
 - Graph: (Procedure) nodes with trigger edges
 - Vector: ChromaDB for semantic search of triggers
+
+Thai NLP Integration:
+- Triggers are preprocessed for Thai tokenization before FTS5
+- Search queries are tokenized for better matching
 """
 
 import json
@@ -19,6 +23,21 @@ from datetime import datetime
 
 from .types import ProceduralMemory, MemoryLayer, utcnow
 from .decay import compute_decay_score, DecayConfig
+
+# Lazy import for Thai NLP
+_nlp_preprocessor = None
+
+
+def _get_nlp_preprocessor():
+    """Get NLP preprocessor (lazy import)."""
+    global _nlp_preprocessor
+    if _nlp_preprocessor is None:
+        try:
+            from synapse.nlp.preprocess import get_preprocessor
+            _nlp_preprocessor = get_preprocessor()
+        except ImportError:
+            _nlp_preprocessor = False  # Mark as unavailable
+    return _nlp_preprocessor if _nlp_preprocessor else None
 
 
 # Default database path
@@ -52,6 +71,7 @@ class ProceduralManager:
                 CREATE TABLE IF NOT EXISTS procedures (
                     id TEXT PRIMARY KEY,
                     trigger TEXT NOT NULL,
+                    trigger_fts TEXT,
                     procedure TEXT NOT NULL,
                     source TEXT DEFAULT 'explicit',
                     success_count INTEGER DEFAULT 0,
@@ -69,11 +89,17 @@ class ProceduralManager:
                 ON procedures(trigger)
             """)
 
-            # FTS5 for full-text search on triggers
+            # FTS5 for full-text search on triggers (using tokenized version)
             conn.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS procedures_fts
-                USING fts5(trigger, content='procedures', content_rowid='rowid')
+                USING fts5(trigger_fts, content='procedures', content_rowid='rowid')
             """)
+
+            # Migration: Add trigger_fts column if not exists
+            try:
+                conn.execute("ALTER TABLE procedures ADD COLUMN trigger_fts TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
     @contextmanager
     def _get_connection(self):
@@ -95,6 +121,7 @@ class ProceduralManager:
         procedure: List[str],
         source: str = "explicit",
         topics: Optional[List[str]] = None,
+        preprocess: bool = True,
     ) -> ProceduralMemory:
         """
         Learn a new procedure.
@@ -104,12 +131,20 @@ class ProceduralManager:
             procedure: List of steps to execute
             source: How this was learned (explicit | correction | repeated_pattern)
             topics: Related topics
+            preprocess: Apply Thai NLP tokenization for FTS
 
         Returns:
             Created ProceduralMemory
         """
         now = utcnow()
         proc_id = str(uuid.uuid4())
+
+        # Tokenize trigger for FTS5 (especially for Thai)
+        trigger_fts = trigger
+        if preprocess:
+            preprocessor = _get_nlp_preprocessor()
+            if preprocessor:
+                trigger_fts = preprocessor.tokenize_for_fts(trigger)
 
         proc = ProceduralMemory(
             id=proc_id,
@@ -125,13 +160,14 @@ class ProceduralManager:
             conn.execute(
                 """
                 INSERT INTO procedures (
-                    id, trigger, procedure, source, success_count, last_used,
+                    id, trigger, trigger_fts, procedure, source, success_count, last_used,
                     topics, created_at, updated_at, decay_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0)
                 """,
                 (
                     proc_id,
                     trigger,
+                    trigger_fts,
                     json.dumps(procedure),
                     source,
                     0,
@@ -149,22 +185,32 @@ class ProceduralManager:
         trigger: str,
         limit: int = 5,
         min_score: float = 0.1,
+        preprocess: bool = True,
     ) -> List[ProceduralMemory]:
         """
         Find procedures matching a trigger.
 
         Uses FTS5 for full-text search on triggers.
+        Thai triggers are tokenized for better FTS5 matching.
 
         Args:
             trigger: Search query
             limit: Maximum results
             min_score: Minimum decay score threshold
+            preprocess: Apply Thai NLP preprocessing
 
         Returns:
             List of matching ProceduralMemory
         """
         procedures = []
         now = utcnow()
+
+        # Preprocess trigger for Thai
+        search_query = trigger
+        if preprocess:
+            preprocessor = _get_nlp_preprocessor()
+            if preprocessor:
+                search_query = preprocessor.tokenize_for_fts(trigger)
 
         with self._get_connection() as conn:
             # Try FTS5 search first
@@ -177,7 +223,7 @@ class ProceduralManager:
                     ORDER BY p.decay_score DESC, p.success_count DESC
                     LIMIT ?
                     """,
-                    (trigger, limit)
+                    (search_query, limit)
                 )
                 rows = cursor.fetchall()
             except sqlite3.OperationalError:
