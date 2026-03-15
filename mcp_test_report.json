@@ -1,0 +1,105 @@
+{
+  "total": 16,
+  "passed": 15,
+  "failed": 1,
+  "success_rate": 93.75,
+  "total_duration_ms": 600.4979610443115,
+  "results": [
+    {
+      "tool": "health_endpoint",
+      "success": true,
+      "duration_ms": 7.745265960693359,
+      "error": null
+    },
+    {
+      "tool": "get_status",
+      "success": true,
+      "duration_ms": 42.12522506713867,
+      "error": null
+    },
+    {
+      "tool": "add_memory",
+      "success": true,
+      "duration_ms": 49.630165100097656,
+      "error": null
+    },
+    {
+      "tool": "add_memory",
+      "success": true,
+      "duration_ms": 44.73423957824707,
+      "error": null
+    },
+    {
+      "tool": "get_episodes",
+      "success": true,
+      "duration_ms": 5.029916763305664,
+      "error": null
+    },
+    {
+      "tool": "search_nodes",
+      "success": true,
+      "duration_ms": 42.89817810058594,
+      "error": null
+    },
+    {
+      "tool": "search_memory_facts",
+      "success": true,
+      "duration_ms": 45.766353607177734,
+      "error": null
+    },
+    {
+      "tool": "get_entity_edge",
+      "success": true,
+      "duration_ms": 46.509742736816406,
+      "error": null
+    },
+    {
+      "tool": "delete_entity_edge",
+      "success": true,
+      "duration_ms": 40.18068313598633,
+      "error": null
+    },
+    {
+      "tool": "delete_episode",
+      "success": false,
+      "duration_ms": 0,
+      "error": "SKIPPED - no episode UUID available"
+    },
+    {
+      "tool": "detect_language",
+      "success": true,
+      "duration_ms": 48.86341094970703,
+      "error": null
+    },
+    {
+      "tool": "preprocess_for_extraction",
+      "success": true,
+      "duration_ms": 43.75600814819336,
+      "error": null
+    },
+    {
+      "tool": "preprocess_for_search",
+      "success": true,
+      "duration_ms": 41.88823699951172,
+      "error": null
+    },
+    {
+      "tool": "tokenize_thai",
+      "success": true,
+      "duration_ms": 51.34415626525879,
+      "error": null
+    },
+    {
+      "tool": "normalize_thai",
+      "success": true,
+      "duration_ms": 42.62423515319824,
+      "error": null
+    },
+    {
+      "tool": "is_thai_text",
+      "success": true,
+      "duration_ms": 47.402143478393555,
+      "error": null
+    }
+  ]
+}
