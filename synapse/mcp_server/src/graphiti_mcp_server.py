@@ -239,6 +239,11 @@ class GraphitiService:
             # Store entity types for later use
             self.entity_types = custom_types
 
+            # Initialize cross encoder (reranker) - use local BGE reranker
+            from synapse.graphiti.cross_encoder.bge_reranker_client import BGERerankerClient
+            cross_encoder = BGERerankerClient()
+            logger.info('Using BGE reranker (local, no API key required)')
+
             # Initialize Graphiti client with appropriate driver
             try:
                 if self.config.database.provider.lower() == 'falkordb':
@@ -256,6 +261,7 @@ class GraphitiService:
                         graph_driver=falkor_driver,
                         llm_client=llm_client,
                         embedder=embedder_client,
+                        cross_encoder=cross_encoder,
                         max_coroutines=self.semaphore_limit,
                     )
                 else:
@@ -266,6 +272,7 @@ class GraphitiService:
                         password=db_config['password'],
                         llm_client=llm_client,
                         embedder=embedder_client,
+                        cross_encoder=cross_encoder,
                         max_coroutines=self.semaphore_limit,
                     )
             except Exception as db_error:

@@ -133,6 +133,13 @@ class VoyageProviderConfig(BaseModel):
     model: str = 'voyage-3'
 
 
+class LocalEmbedderProviderConfig(BaseModel):
+    """Local embedder (sentence-transformers) configuration."""
+
+    model_name: str = 'intfloat/multilingual-e5-small'
+    device: str | None = None  # auto-detect if None
+
+
 class LLMProvidersConfig(BaseModel):
     """LLM providers configuration."""
 
@@ -162,6 +169,7 @@ class EmbedderProvidersConfig(BaseModel):
     azure_openai: AzureOpenAIProviderConfig | None = None
     gemini: GeminiProviderConfig | None = None
     voyage: VoyageProviderConfig | None = None
+    local: LocalEmbedderProviderConfig | None = None
 
 
 class EmbedderConfig(BaseModel):

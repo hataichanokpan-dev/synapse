@@ -18,6 +18,7 @@ except ImportError:
 from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
 from graphiti_core.llm_client import LLMClient, OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
+from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 
 # Try to import additional providers if available
 try:
@@ -119,8 +120,16 @@ class LLMClientFactory:
                 # Use the same model for both main and small model slots
                 small_model = config.model
 
+                # Get base_url for OpenAI-compatible endpoints (e.g., Z.ai, Ollama)
+                base_url = config.providers.openai.api_url
+                is_custom_endpoint = base_url and base_url != 'https://api.openai.com/v1'
+
+                if is_custom_endpoint:
+                    logger.info(f'Using custom LLM endpoint: {base_url} (using OpenAIGenericClient)')
+
                 llm_config = CoreLLMConfig(
                     api_key=api_key,
+                    base_url=base_url,
                     model=config.model,
                     small_model=small_model,
                     temperature=config.temperature,
@@ -130,6 +139,11 @@ class LLMClientFactory:
                 # Check if this is a reasoning model (o1, o3, gpt-5 family)
                 reasoning_prefixes = ('o1', 'o3', 'gpt-5')
                 is_reasoning_model = config.model.startswith(reasoning_prefixes)
+
+                # Use OpenAIGenericClient for custom endpoints (better compatibility with Ollama, Z.ai, etc.)
+                # It uses chat.completions.create instead of responses.parse
+                if is_custom_endpoint:
+                    return OpenAIGenericClient(config=llm_config, max_tokens=config.max_tokens)
 
                 # Only pass reasoning/verbosity parameters for reasoning models (gpt-5 family)
                 if is_reasoning_model:
@@ -353,6 +367,32 @@ class EmbedderFactory:
                     embedding_dim=config.dimensions or 1024,
                 )
                 return VoyageAIEmbedder(config=voyage_config)
+
+            case 'local':
+                # Import from local graphiti module (vendored), not graphiti_core
+                import sys
+                from pathlib import Path
+
+                # Add synapse to path if not already there
+                synapse_path = Path(__file__).parent.parent.parent.parent
+                if str(synapse_path) not in sys.path:
+                    sys.path.insert(0, str(synapse_path))
+
+                from graphiti.embedder.local import LocalEmbedder, LocalEmbedderConfig
+
+                # Get local config or use defaults
+                local_config = config.providers.local
+                model_name = local_config.model_name if local_config else 'intfloat/multilingual-e5-small'
+                device = local_config.device if local_config else None
+
+                logger.info(f'Creating Local Embedder: model={model_name}, dim={config.dimensions}')
+
+                embedder_config = LocalEmbedderConfig(
+                    embedding_dim=config.dimensions or 384,
+                    model_name=model_name,
+                    device=device,
+                )
+                return LocalEmbedder(config=embedder_config)
 
             case _:
                 raise ValueError(f'Unsupported Embedder provider: {provider}')

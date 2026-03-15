@@ -31,7 +31,7 @@
     <img src="https://img.shields.io/badge/License-Apache%202.0-purple?logo=opensourceinitiative&logoColor=white" alt="License">
   </a>
   <a href="https://github.com/features/actions">
-    <img src="https://img.shields.io/badge/Status-Phase%204%20Complete-brightgreen?logo=github" alt="Project Status">
+    <img src="https://img.shields.io/badge/Status-Phase%205%20M2%20Complete-brightgreen?logo=github" alt="Project Status">
   </a>
 </p>
 
@@ -324,7 +324,15 @@ class CustomLayer:
 | Phase 2 | ✅ Complete | Vendored Graphiti, MCP server |
 | Phase 3 | ✅ Complete | Five-Layer Memory System |
 | Phase 4 | ✅ Complete | Thai NLP Integration |
-| Phase 5 | 🔜 Planned | Deploy to JellyCore |
+| Phase 5 | 🚧 In Progress | Deploy as Memory Backend for Cerberus |
+
+### Phase 5 Progress
+
+| Milestone | Status | Description |
+|-----------|--------|-------------|
+| M1 Smoke Test | ✅ Complete | Basic functionality verified |
+| M2 MCP Integration | ✅ Complete | Anthropic LLM + Local Embedder + BGE Reranker |
+| M3 Production Deploy | ⏳ Pending | Docker Compose + Production Config |
 
 ---
 

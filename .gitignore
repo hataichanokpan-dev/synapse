@@ -69,3 +69,16 @@ Thumbs.db
 *.tmp
 *.temp
 .cache/
+
+# Hugging Face cache (models can be large)
+.cache/huggingface/
+models/
+*.bin
+*.safetensors
+*.gguf
+
+# Credentials (extra protection)
+**/credentials.json
+**/secrets.json
+**/*.pem
+**/*.key
