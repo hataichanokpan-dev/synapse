@@ -1,5 +1,6 @@
-# Synapse Docker Compose
-# Knowledge Graph + Vector DB + Thai NLP
+# Synapse Production Docker Compose
+# Memory Backend for Cerberus AI
+# Version: 1.0.0
 
 services:
   # FalkorDB - Graph Database (Redis-based)
@@ -7,28 +8,44 @@ services:
     image: falkordb/falkordb:latest
     container_name: synapse-falkordb
     ports:
-      - "6379:6379"
+      - "${FALKORDB_PORT:-6379}:6379"
     volumes:
       - falkordb_data:/data
     environment:
-      - FALKORDB_ARGS=--save 60 1
+      - FALKORDB_ARGS=--save 60 1 --maxmemory 512mb --maxmemory-policy allkeys-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
     restart: unless-stopped
+    networks:
+      - synapse-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
   # Qdrant - Vector Database
   qdrant:
     image: qdrant/qdrant:latest
     container_name: synapse-qdrant
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
     volumes:
       - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__HTTP_PORT=6333
+      - QDRANT__SERVICE__GRPC_PORT=6334
     restart: unless-stopped
+    networks:
+      - synapse-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
   # Synapse MCP Server
   synapse:
@@ -37,19 +54,50 @@ services:
       dockerfile: Dockerfile
     container_name: synapse-server
     ports:
-      - "47780:47780"
+      - "${SYNAPSE_PORT:-47780}:47780"
     environment:
-      - FALKORDB_URI=redis://falkordb:6379
-      - QDRANT_URL=http://qdrant:6333
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # LLM Configuration
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+      # Database Configuration
+      - FALKORDB_URI=redis://falkordb:6379
+      - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
+      - FALKORDB_DATABASE=${FALKORDB_DATABASE:-synapse}
+
+      # Graphiti Configuration
+      - GRAPHITI_GROUP_ID=${GRAPHITI_GROUP_ID:-main}
+      - USER_ID=${USER_ID:-cerberus}
+
+      # Performance
+      - SEMAPHORE_LIMIT=${SEMAPHORE_LIMIT:-10}
     depends_on:
       falkordb:
         condition: service_healthy
       qdrant:
         condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:47780/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     restart: unless-stopped
+    networks:
+      - synapse-network
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+networks:
+  synapse-network:
+    driver: bridge
+    name: synapse-network
 
 volumes:
   falkordb_data:
+    name: synapse-falkordb-data
   qdrant_data:
+    name: synapse-qdrant-data

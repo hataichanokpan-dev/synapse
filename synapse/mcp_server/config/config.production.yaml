@@ -1,0 +1,66 @@
+# Synapse MCP Server - Production Configuration
+# For use with Docker Compose
+
+server:
+  transport: "http"
+  host: "0.0.0.0"
+  port: 47780
+
+llm:
+  provider: "anthropic"
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 4096
+  temperature: 0.7
+
+  providers:
+    anthropic:
+      api_key: ${ANTHROPIC_API_KEY}
+
+embedder:
+  provider: "local"
+  model: "intfloat/multilingual-e5-small"
+  dimensions: 384
+
+  providers:
+    local:
+      model_name: "intfloat/multilingual-e5-small"
+      device: null
+
+database:
+  provider: "falkordb"
+
+  providers:
+    falkordb:
+      uri: ${FALKORDB_URI:-redis://falkordb:6379}
+      password: ${FALKORDB_PASSWORD:-}
+      database: ${FALKORDB_DATABASE:-synapse}
+
+graphiti:
+  group_id: ${GRAPHITI_GROUP_ID:-main}
+  episode_id_prefix: ${EPISODE_ID_PREFIX:-}
+  user_id: ${USER_ID:-cerberus}
+
+  # Custom entity types for Cerberus
+  entity_types:
+    - name: "Preference"
+      description: "User preferences, choices, opinions, or selections"
+    - name: "Requirement"
+      description: "Specific needs, features, or functionality that must be fulfilled"
+    - name: "Procedure"
+      description: "Standard operating procedures and sequential instructions"
+    - name: "Location"
+      description: "Physical or virtual places where activities occur"
+    - name: "Event"
+      description: "Time-bound activities, occurrences, or experiences"
+    - name: "Organization"
+      description: "Companies, institutions, groups, or formal entities"
+    - name: "Document"
+      description: "Information content in various forms"
+    - name: "Topic"
+      description: "Subject of conversation, interest, or knowledge domain"
+    - name: "Object"
+      description: "Physical items, tools, devices, or possessions"
+    - name: "Person"
+      description: "People mentioned in conversations"
+    - name: "Project"
+      description: "Projects, tasks, or work items"
