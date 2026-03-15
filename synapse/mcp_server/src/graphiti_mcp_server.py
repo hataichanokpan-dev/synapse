@@ -21,6 +21,8 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
+from synapse.storage import QdrantClient as SynapseQdrantClient
+
 from config.schema import GraphitiConfig, ServerConfig
 from models.response_types import (
     EpisodeSearchResponse,
@@ -165,6 +167,7 @@ queue_service: QueueService | None = None
 
 # Global client for backward compatibility
 graphiti_client: Graphiti | None = None
+qdrant_client: SynapseQdrantClient | None = None
 semaphore: asyncio.Semaphore
 
 
@@ -176,6 +179,7 @@ class GraphitiService:
         self.semaphore_limit = semaphore_limit
         self.semaphore = asyncio.Semaphore(semaphore_limit)
         self.client: Graphiti | None = None
+        self.vector_store: SynapseQdrantClient | None = None
         self.entity_types = None
 
     async def initialize(self) -> None:
@@ -196,6 +200,22 @@ class GraphitiService:
                 embedder_client = EmbedderFactory.create(self.config.embedder)
             except Exception as e:
                 logger.warning(f'Failed to create embedder client: {e}')
+
+            # Initialize Qdrant for the Synapse memory layers.
+            try:
+                self.vector_store = SynapseQdrantClient(
+                    url=os.getenv('QDRANT_URL'),
+                    api_key=os.getenv('QDRANT_API_KEY'),
+                )
+                for collection_name in (
+                    'semantic_memory',
+                    'episodic_memory',
+                    'procedural_memory',
+                ):
+                    self.vector_store.create_collection(collection_name=collection_name)
+            except Exception as e:
+                self.vector_store = None
+                logger.warning(f'Failed to initialize Qdrant client: {e}')
 
             # Get database configuration
             db_config = DatabaseDriverFactory.create_config(self.config.database)
@@ -305,6 +325,11 @@ class GraphitiService:
                 logger.info(f'Using Embedder provider: {self.config.embedder.provider}')
             else:
                 logger.info('No Embedder client configured - search will be limited')
+
+            if self.vector_store:
+                logger.info(f'Using Qdrant vector store at {self.vector_store.url}')
+            else:
+                logger.info('Qdrant vector store not available for Synapse memory layers')
 
             if self.entity_types:
                 entity_type_names = list(self.entity_types.keys())
@@ -771,7 +796,7 @@ async def health_check(request) -> JSONResponse:
 
 async def initialize_server() -> ServerConfig:
     """Parse CLI arguments and initialize the Graphiti server configuration."""
-    global config, graphiti_service, queue_service, graphiti_client, semaphore
+    global config, graphiti_service, queue_service, graphiti_client, qdrant_client, semaphore
 
     parser = argparse.ArgumentParser(
         description='Run the Graphiti MCP server with YAML configuration support'
@@ -900,6 +925,7 @@ async def initialize_server() -> ServerConfig:
 
     # Set global client for backward compatibility
     graphiti_client = await graphiti_service.get_client()
+    qdrant_client = graphiti_service.vector_store
     semaphore = graphiti_service.semaphore
 
     # Initialize queue service with the client

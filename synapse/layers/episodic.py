@@ -6,7 +6,7 @@ TTL-BASED - 90 days base, +30 days extension on access
 
 Storage:
 - Graph: (Episode) nodes with expires_at
-- Vector: ChromaDB for semantic search
+- Vector: Qdrant for semantic search
 
 Episodic memories have a Time-To-Live (TTL) instead of decay scoring.
 Access extends TTL by 30 days (max 30 extra days from access count).
@@ -17,6 +17,7 @@ Thai NLP Integration:
 """
 
 import json
+import logging
 import sqlite3
 import uuid
 from pathlib import Path
@@ -24,8 +25,12 @@ from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
+from synapse.storage import QdrantClient
+
 from .types import SynapseEpisode, MemoryLayer, utcnow
 from .decay import compute_ttl, extend_ttl, should_forget, DecayConfig
+
+logger = logging.getLogger(__name__)
 
 # Lazy import for Thai NLP
 _nlp_preprocessor = None
@@ -45,6 +50,7 @@ def _get_nlp_preprocessor():
 
 # Default database path
 DEFAULT_DB_PATH = Path.home() / ".synapse" / "episodic.db"
+DEFAULT_COLLECTION_NAME = "episodic_memory"
 
 
 class EpisodicManager:
@@ -55,7 +61,12 @@ class EpisodicManager:
     Access extends TTL by 30 days.
     """
 
-    def __init__(self, db_path: Optional[Path] = None):
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        vector_client: Optional[QdrantClient] = None,
+        collection_name: str = DEFAULT_COLLECTION_NAME,
+    ):
         """
         Initialize Episodic Memory Manager.
 
@@ -63,6 +74,9 @@ class EpisodicManager:
             db_path: Path to SQLite database (default: ~/.synapse/episodic.db)
         """
         self.db_path = db_path or DEFAULT_DB_PATH
+        self.vector_client = vector_client or QdrantClient()
+        self.collection_name = collection_name
+        self._vector_warning_emitted = False
         self._ensure_db()
 
     def _ensure_db(self) -> None:
@@ -135,6 +149,162 @@ class EpisodicManager:
             raise
         finally:
             conn.close()
+
+    def _warn_vector_issue(self, exc: Exception) -> None:
+        """Log a single warning when Qdrant is unavailable."""
+        if self._vector_warning_emitted:
+            return
+
+        logger.warning("Episodic memory Qdrant integration unavailable: %s", exc)
+        self._vector_warning_emitted = True
+
+    def _row_to_episode(self, row: sqlite3.Row) -> SynapseEpisode:
+        """Convert a SQLite row into a SynapseEpisode model."""
+        return SynapseEpisode(
+            id=row["id"],
+            content=row["content"],
+            summary=row["summary"],
+            topics=json.loads(row["topics"]),
+            outcome=row["outcome"],
+            memory_layer=MemoryLayer(row["memory_layer"]),
+            recorded_at=self._parse_datetime(row["recorded_at"]) or utcnow(),
+            expires_at=self._parse_datetime(row["expires_at"]) if row["expires_at"] else None,
+            user_id=row["user_id"],
+            session_id=row["session_id"],
+        )
+
+    def _get_episode_rows(self, episode_ids: List[str]) -> dict[str, sqlite3.Row]:
+        """Fetch multiple episode rows keyed by ID."""
+        if not episode_ids:
+            return {}
+
+        placeholders = ", ".join("?" for _ in episode_ids)
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                f"SELECT * FROM episodes WHERE id IN ({placeholders})",
+                episode_ids,
+            )
+            rows = cursor.fetchall()
+
+        return {str(row["id"]): row for row in rows}
+
+    def _index_episode(
+        self,
+        episode: SynapseEpisode,
+        access_count: int = 0,
+    ) -> None:
+        """Store episode content and metadata in Qdrant."""
+        try:
+            self.vector_client.upsert(
+                collection_name=self.collection_name,
+                points=[
+                    {
+                        "id": episode.id,
+                        "text": "\n".join(
+                            part
+                            for part in [episode.summary or "", episode.content]
+                            if part
+                        ),
+                        "payload": {
+                            "episode_id": episode.id,
+                            "summary": episode.summary,
+                            "content": episode.content,
+                            "topics": episode.topics,
+                            "outcome": episode.outcome,
+                            "recorded_at": episode.recorded_at.isoformat(),
+                            "recorded_at_ts": episode.recorded_at.timestamp(),
+                            "expires_at": episode.expires_at.isoformat()
+                            if episode.expires_at
+                            else None,
+                            "expires_at_ts": episode.expires_at.timestamp()
+                            if episode.expires_at
+                            else None,
+                            "user_id": episode.user_id,
+                            "session_id": episode.session_id,
+                            "access_count": access_count,
+                            "memory_layer": MemoryLayer.EPISODIC.value,
+                        },
+                    }
+                ],
+            )
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+
+    def _index_episode_row(self, row: sqlite3.Row) -> None:
+        """Re-index a persisted episode row into Qdrant."""
+        self._index_episode(
+            self._row_to_episode(row),
+            access_count=row["access_count"],
+        )
+
+    def _delete_from_vector_store(self, episode_id: str) -> None:
+        """Delete an episode point from Qdrant."""
+        try:
+            self.vector_client.delete(
+                collection_name=self.collection_name,
+                ids=[episode_id],
+            )
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+
+    def _find_episodes_vector(
+        self,
+        query: str,
+        topics: Optional[List[str]],
+        outcome: Optional[str],
+        user_id: Optional[str],
+        limit: int,
+        include_expired: bool,
+    ) -> Optional[List[SynapseEpisode]]:
+        """Try semantic retrieval from Qdrant. Returns None when unavailable."""
+        filters: Dict[str, Any] = {}
+        if outcome:
+            filters["outcome"] = outcome
+        if user_id:
+            filters["user_id"] = user_id
+        if topics:
+            filters["topics"] = {"any": topics}
+
+        try:
+            results = self.vector_client.search(
+                collection_name=self.collection_name,
+                query_text=query,
+                limit=max(limit * 4, limit),
+                filters=filters or None,
+            )
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+            return None
+
+        if not results:
+            return []
+
+        rows_by_id = self._get_episode_rows([result["id"] for result in results])
+        episodes = []
+        now = utcnow()
+
+        for result in results:
+            row = rows_by_id.get(result["id"])
+            if row is None:
+                continue
+
+            episode = self._row_to_episode(row)
+
+            if not include_expired and episode.expires_at and episode.expires_at <= now:
+                continue
+            if outcome and episode.outcome != outcome:
+                continue
+            if user_id and episode.user_id != user_id:
+                continue
+            if topics and not all(topic in episode.topics for topic in topics):
+                continue
+
+            episodes.append(episode)
+
+            if len(episodes) >= limit:
+                break
+
+        return episodes
 
     def record_episode(
         self,
@@ -223,6 +393,7 @@ class EpisodicManager:
                 )
             )
 
+        self._index_episode(episode, access_count=0)
         return episode
 
     def get_episode(self, episode_id: str) -> Optional[SynapseEpisode]:
@@ -261,7 +432,7 @@ class EpisodicManager:
                     (new_expires.isoformat(), episode_id)
                 )
 
-            return SynapseEpisode(
+            episode = SynapseEpisode(
                 id=row["id"],
                 content=row["content"],
                 summary=row["summary"],
@@ -273,6 +444,12 @@ class EpisodicManager:
                 user_id=row["user_id"],
                 session_id=row["session_id"],
             )
+
+        self._index_episode(
+            episode,
+            access_count=row["access_count"] + (1 if new_expires is not None else 0),
+        )
+        return episode
 
     def find_episodes(
         self,
@@ -302,6 +479,18 @@ class EpisodicManager:
         Returns:
             List of SynapseEpisode
         """
+        if query:
+            vector_results = self._find_episodes_vector(
+                query=query,
+                topics=topics,
+                outcome=outcome,
+                user_id=user_id,
+                limit=limit,
+                include_expired=include_expired,
+            )
+            if vector_results is not None:
+                return vector_results
+
         episodes = []
         now = utcnow()
 
@@ -454,6 +643,7 @@ class EpisodicManager:
                     pass
 
                 conn.execute("DELETE FROM episodes WHERE id = ?", (row["id"],))
+                self._delete_from_vector_store(str(row["id"]))
                 count += 1
 
         return count
@@ -476,9 +666,10 @@ class EpisodicManager:
         if extra_days is None:
             extra_days = DecayConfig.TTL_EXTEND_DAYS
 
+        updated_row = None
         with self._get_connection() as conn:
             cursor = conn.execute(
-                "SELECT expires_at FROM episodes WHERE id = ?",
+                "SELECT * FROM episodes WHERE id = ?",
                 (episode_id,)
             )
             row = cursor.fetchone()
@@ -494,8 +685,16 @@ class EpisodicManager:
                     "UPDATE episodes SET expires_at = ? WHERE id = ?",
                     (new_expires.isoformat(), episode_id)
                 )
+                cursor = conn.execute(
+                    "SELECT * FROM episodes WHERE id = ?",
+                    (episode_id,),
+                )
+                updated_row = cursor.fetchone()
 
-            return new_expires
+        if updated_row is not None:
+            self._index_episode_row(updated_row)
+
+        return new_expires
 
     def get_episodes_by_session(self, session_id: str) -> List[SynapseEpisode]:
         """
@@ -552,7 +751,12 @@ class EpisodicManager:
                 "DELETE FROM episodes WHERE id = ?",
                 (episode_id,)
             )
-            return cursor.rowcount > 0
+            deleted = cursor.rowcount > 0
+
+        if deleted:
+            self._delete_from_vector_store(episode_id)
+
+        return deleted
 
     def _parse_datetime(self, dt_str: Optional[str]) -> Optional[datetime]:
         """Parse ISO format datetime string."""

@@ -19,24 +19,15 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # ChromaDB - Vector Database
-  chromadb:
-    image: chromadb/chroma:latest
-    container_name: synapse-chromadb
+  # Qdrant - Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: synapse-qdrant
     ports:
-      - "8000:8000"
+      - "6333:6333"
+      - "6334:6334"
     volumes:
-      - chromadb_data:/chroma/chroma
-    environment:
-      - CHROMA_SERVER_AUTH_CREDENTIALS=${CHROMA_AUTH_TOKEN:-synapse}
-      - CHROMA_SERVER_AUTH_CREDENTIALS_PROVIDER=chromadb.auth.token.TokenAuthServerProviderCredentials
-      - CHROMA_SERVER_AUTH_PROVIDER=chromadb.auth.token.TokenAuthenticationServerProvider
-      - CHROMA_SERVER_AUTH_TOKEN_TRANSPORT_HEADER=X-Chroma-Token
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - qdrant_data:/qdrant/storage
     restart: unless-stopped
 
   # Synapse MCP Server
@@ -49,17 +40,16 @@ services:
       - "47780:47780"
     environment:
       - FALKORDB_URI=redis://falkordb:6379
-      - CHROMA_URI=http://chromadb:8000
+      - QDRANT_URL=http://qdrant:6333
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - CHROMA_AUTH_TOKEN=${CHROMA_AUTH_TOKEN:-synapse}
     depends_on:
       falkordb:
         condition: service_healthy
-      chromadb:
-        condition: service_healthy
+      qdrant:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
   falkordb_data:
-  chromadb_data:
+  qdrant_data:

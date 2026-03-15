@@ -6,23 +6,29 @@ SLOW DECAY - λ = 0.005, half-life ~139 days
 
 Storage:
 - Graph: (Procedure) nodes with trigger edges
-- Vector: ChromaDB for semantic search of triggers
+- Vector: Qdrant for semantic search of triggers
 
 Thai NLP Integration:
 - Triggers are preprocessed for Thai tokenization before FTS5
 - Search queries are tokenized for better matching
+- Qdrant indexing applies Thai-aware preprocessing before vectorization
 """
 
 import json
+import logging
 import sqlite3
 import uuid
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 from contextlib import contextmanager
 from datetime import datetime
 
+from synapse.storage import QdrantClient
+
 from .types import ProceduralMemory, MemoryLayer, utcnow
-from .decay import compute_decay_score, DecayConfig
+from .decay import compute_decay_score
+
+logger = logging.getLogger(__name__)
 
 # Lazy import for Thai NLP
 _nlp_preprocessor = None
@@ -42,6 +48,7 @@ def _get_nlp_preprocessor():
 
 # Default database path
 DEFAULT_DB_PATH = Path.home() / ".synapse" / "procedural.db"
+DEFAULT_COLLECTION_NAME = "procedural_memory"
 
 
 class ProceduralManager:
@@ -52,7 +59,12 @@ class ProceduralManager:
     Success count boosts decay score.
     """
 
-    def __init__(self, db_path: Optional[Path] = None):
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        vector_client: Optional[QdrantClient] = None,
+        collection_name: str = DEFAULT_COLLECTION_NAME,
+    ):
         """
         Initialize Procedural Memory Manager.
 
@@ -60,6 +72,9 @@ class ProceduralManager:
             db_path: Path to SQLite database (default: ~/.synapse/procedural.db)
         """
         self.db_path = db_path or DEFAULT_DB_PATH
+        self.vector_client = vector_client or QdrantClient()
+        self.collection_name = collection_name
+        self._vector_warning_emitted = False
         self._ensure_db()
 
     def _ensure_db(self) -> None:
@@ -114,6 +129,164 @@ class ProceduralManager:
             raise
         finally:
             conn.close()
+
+    def _warn_vector_issue(self, exc: Exception) -> None:
+        """Log a single warning when Qdrant is unavailable."""
+        if self._vector_warning_emitted:
+            return
+
+        logger.warning("Procedural memory Qdrant integration unavailable: %s", exc)
+        self._vector_warning_emitted = True
+
+    def _get_procedure_row(self, procedure_id: str) -> Optional[sqlite3.Row]:
+        """Fetch a single procedure row."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM procedures WHERE id = ?",
+                (procedure_id,),
+            )
+            return cursor.fetchone()
+
+    def _get_procedure_rows(self, procedure_ids: List[str]) -> dict[str, sqlite3.Row]:
+        """Fetch multiple procedure rows keyed by ID."""
+        if not procedure_ids:
+            return {}
+
+        placeholders = ", ".join("?" for _ in procedure_ids)
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                f"SELECT * FROM procedures WHERE id IN ({placeholders})",
+                procedure_ids,
+            )
+            rows = cursor.fetchall()
+
+        return {str(row["id"]): row for row in rows}
+
+    def _row_to_procedure(self, row: sqlite3.Row) -> ProceduralMemory:
+        """Convert a SQLite row into a ProceduralMemory model."""
+        return ProceduralMemory(
+            id=row["id"],
+            trigger=row["trigger"],
+            procedure=json.loads(row["procedure"]),
+            source=row["source"],
+            success_count=row["success_count"],
+            last_used=self._parse_datetime(row["last_used"]) if row["last_used"] else None,
+            topics=json.loads(row["topics"]),
+        )
+
+    def _index_procedure(
+        self,
+        procedure_id: str,
+        trigger: str,
+        steps: List[str],
+        source: str,
+        topics: List[str],
+        success_count: int,
+        last_used: Optional[str | datetime],
+        created_at: datetime,
+        updated_at: datetime,
+        decay_score: float,
+    ) -> None:
+        """Store procedure text and metadata in Qdrant."""
+        if isinstance(last_used, datetime):
+            last_used_value = last_used.isoformat()
+        else:
+            last_used_value = last_used
+
+        try:
+            self.vector_client.upsert(
+                collection_name=self.collection_name,
+                points=[
+                    {
+                        "id": procedure_id,
+                        "text": "\n".join([trigger, *steps]),
+                        "payload": {
+                            "procedure_id": procedure_id,
+                            "trigger": trigger,
+                            "steps": steps,
+                            "source": source,
+                            "topics": topics,
+                            "success_count": success_count,
+                            "last_used": last_used_value,
+                            "created_at": created_at.isoformat(),
+                            "updated_at": updated_at.isoformat(),
+                            "decay_score": decay_score,
+                            "memory_layer": MemoryLayer.PROCEDURAL.value,
+                        },
+                    }
+                ],
+            )
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+
+    def _index_procedure_row(self, row: sqlite3.Row) -> None:
+        """Re-index a persisted procedure row into Qdrant."""
+        self._index_procedure(
+            procedure_id=str(row["id"]),
+            trigger=row["trigger"],
+            steps=json.loads(row["procedure"]),
+            source=row["source"],
+            topics=json.loads(row["topics"]),
+            success_count=row["success_count"],
+            last_used=row["last_used"],
+            created_at=self._parse_datetime(row["created_at"]),
+            updated_at=self._parse_datetime(row["updated_at"]),
+            decay_score=float(row["decay_score"]),
+        )
+
+    def _delete_from_vector_store(self, procedure_id: str) -> None:
+        """Delete a procedure point from Qdrant."""
+        try:
+            self.vector_client.delete(
+                collection_name=self.collection_name,
+                ids=[procedure_id],
+            )
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+
+    def _find_procedure_vector(
+        self,
+        trigger: str,
+        limit: int,
+        min_score: float,
+    ) -> Optional[List[ProceduralMemory]]:
+        """Try semantic retrieval from Qdrant. Returns None when unavailable."""
+        try:
+            results = self.vector_client.search(
+                collection_name=self.collection_name,
+                query_text=trigger,
+                limit=max(limit * 3, limit),
+            )
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+            return None
+
+        if not results:
+            return []
+
+        rows_by_id = self._get_procedure_rows([result["id"] for result in results])
+        procedures = []
+        now = utcnow()
+
+        for result in results:
+            row = rows_by_id.get(result["id"])
+            if row is None:
+                continue
+
+            decay_score = compute_decay_score(
+                updated_at=self._parse_datetime(row["updated_at"]),
+                access_count=row["success_count"],
+                memory_layer=MemoryLayer.PROCEDURAL,
+                now=now,
+            )
+
+            if decay_score >= min_score:
+                procedures.append(self._row_to_procedure(row))
+
+            if len(procedures) >= limit:
+                break
+
+        return procedures
 
     def learn_procedure(
         self,
@@ -178,6 +351,19 @@ class ProceduralManager:
                 )
             )
 
+        self._index_procedure(
+            procedure_id=proc_id,
+            trigger=trigger,
+            steps=procedure,
+            source=source,
+            topics=topics or [],
+            success_count=0,
+            last_used=None,
+            created_at=now,
+            updated_at=now,
+            decay_score=1.0,
+        )
+
         return proc
 
     def find_procedure(
@@ -202,6 +388,10 @@ class ProceduralManager:
         Returns:
             List of matching ProceduralMemory
         """
+        vector_results = self._find_procedure_vector(trigger, limit, min_score)
+        if vector_results is not None:
+            return vector_results
+
         procedures = []
         now = utcnow()
 
@@ -250,16 +440,7 @@ class ProceduralManager:
                 )
 
                 if decay_score >= min_score:
-                    proc = ProceduralMemory(
-                        id=row["id"],
-                        trigger=row["trigger"],
-                        procedure=json.loads(row["procedure"]),
-                        source=row["source"],
-                        success_count=row["success_count"],
-                        last_used=self._parse_datetime(row["last_used"]) if row["last_used"] else None,
-                        topics=json.loads(row["topics"]),
-                    )
-                    procedures.append(proc)
+                    procedures.append(self._row_to_procedure(row))
 
         return procedures
 
@@ -273,25 +454,8 @@ class ProceduralManager:
         Returns:
             ProceduralMemory or None if not found
         """
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                "SELECT * FROM procedures WHERE id = ?",
-                (procedure_id,)
-            )
-            row = cursor.fetchone()
-
-            if row is None:
-                return None
-
-            return ProceduralMemory(
-                id=row["id"],
-                trigger=row["trigger"],
-                procedure=json.loads(row["procedure"]),
-                source=row["source"],
-                success_count=row["success_count"],
-                last_used=self._parse_datetime(row["last_used"]) if row["last_used"] else None,
-                topics=json.loads(row["topics"]),
-            )
+        row = self._get_procedure_row(procedure_id)
+        return self._row_to_procedure(row) if row is not None else None
 
     def record_success(self, procedure_id: str) -> Optional[ProceduralMemory]:
         """
@@ -307,6 +471,7 @@ class ProceduralManager:
             Updated ProceduralMemory or None if not found
         """
         now = utcnow()
+        updated_row = None
 
         with self._get_connection() as conn:
             # Get current procedure
@@ -339,7 +504,17 @@ class ProceduralManager:
                 (new_success_count, now.isoformat(), now.isoformat(), decay_score, procedure_id)
             )
 
-        return self.get_procedure(procedure_id)
+            cursor = conn.execute(
+                "SELECT * FROM procedures WHERE id = ?",
+                (procedure_id,),
+            )
+            updated_row = cursor.fetchone()
+
+        if updated_row is None:
+            return None
+
+        self._index_procedure_row(updated_row)
+        return self._row_to_procedure(updated_row)
 
     def get_decay_score(self, procedure_id: str) -> float:
         """
@@ -412,7 +587,12 @@ class ProceduralManager:
                 "DELETE FROM procedures WHERE id = ?",
                 (procedure_id,)
             )
-            return cursor.rowcount > 0
+            deleted = cursor.rowcount > 0
+
+        if deleted:
+            self._delete_from_vector_store(procedure_id)
+
+        return deleted
 
     def list_procedures(
         self,
@@ -464,16 +644,7 @@ class ProceduralManager:
                 )
 
                 if decay_score >= min_score:
-                    proc = ProceduralMemory(
-                        id=row["id"],
-                        trigger=row["trigger"],
-                        procedure=json.loads(row["procedure"]),
-                        source=row["source"],
-                        success_count=row["success_count"],
-                        last_used=self._parse_datetime(row["last_used"]) if row["last_used"] else None,
-                        topics=json.loads(row["topics"]),
-                    )
-                    procedures.append(proc)
+                    procedures.append(self._row_to_procedure(row))
 
         return procedures
 

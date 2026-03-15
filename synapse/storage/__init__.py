@@ -1,9 +1,5 @@
-"""Storage Module"""
+"""Storage clients used by Synapse."""
 
-from synapse.storage.falkordb import FalkorDBClient
-from synapse.storage.sqlite import SQLiteClient
+from synapse.storage.qdrant_client import QdrantClient
 
-__all__ = [
-    "FalkorDBClient",
-    "SQLiteClient",
-]
+__all__ = ['QdrantClient']

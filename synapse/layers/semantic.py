@@ -6,7 +6,7 @@ NORMAL DECAY - λ = 0.01, half-life ~69 days
 
 Storage:
 - Graph: Entity nodes + Fact edges (via Graphiti)
-- Vector: ChromaDB for embeddings
+- Vector: Qdrant for embeddings
 
 This layer wraps Graphiti's functionality with:
 - Decay scoring on retrieval
@@ -15,9 +15,11 @@ This layer wraps Graphiti's functionality with:
 - Thai NLP preprocessing for better extraction
 """
 
-import asyncio
+import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+
+from synapse.storage import QdrantClient
 
 from .types import (
     SynapseNode,
@@ -28,7 +30,10 @@ from .types import (
     RelationType,
     utcnow,
 )
-from .decay import compute_decay_score, should_forget, DecayConfig
+from .decay import compute_decay_score, should_forget
+
+logger = logging.getLogger(__name__)
+DEFAULT_COLLECTION_NAME = "semantic_memory"
 
 # Lazy import for Thai NLP
 _nlp_preprocessor = None
@@ -53,7 +58,12 @@ class SemanticManager:
     Wraps Graphiti with decay scoring and supersede patterns.
     """
 
-    def __init__(self, graphiti_client=None):
+    def __init__(
+        self,
+        graphiti_client=None,
+        vector_client: Optional[QdrantClient] = None,
+        collection_name: str = DEFAULT_COLLECTION_NAME,
+    ):
         """
         Initialize Semantic Memory Manager.
 
@@ -61,22 +71,102 @@ class SemanticManager:
             graphiti_client: Graphiti client instance (optional, lazy-loaded)
         """
         self._graphiti = graphiti_client
+        self.vector_client = vector_client or QdrantClient()
+        self.collection_name = collection_name
         self._initialized = False
+        self._vector_warning_emitted = False
 
-    async def _ensure_graphiti(self):
-        """Ensure Graphiti client is initialized."""
+    async def _ensure_graphiti(self, require: bool = False) -> bool:
+        """Ensure Graphiti client is initialized when available."""
         if self._graphiti is None:
-            # Lazy import to avoid circular dependency
             try:
                 from graphiti_core import Graphiti
-                # Initialize with default config
-                # TODO: Get config from environment or config file
+
                 self._graphiti = Graphiti()
                 self._initialized = True
-            except ImportError:
-                raise RuntimeError(
-                    "Graphiti not available. Install graphiti-core or provide client."
-                )
+            except Exception as exc:
+                if require:
+                    raise RuntimeError(
+                        "Graphiti not available. Install graphiti-core or provide client."
+                    ) from exc
+                return False
+        return True
+
+    def _warn_vector_issue(self, exc: Exception) -> None:
+        """Log a single warning when Qdrant is unavailable."""
+        if self._vector_warning_emitted:
+            return
+
+        logger.warning("Semantic memory Qdrant integration unavailable: %s", exc)
+        self._vector_warning_emitted = True
+
+    def _index_entity(self, node: SynapseNode) -> None:
+        """Store entity text and metadata in Qdrant."""
+        try:
+            self.vector_client.upsert(
+                collection_name=self.collection_name,
+                points=[
+                    {
+                        "id": node.id,
+                        "text": "\n".join(part for part in [node.name, node.summary or ""] if part),
+                        "payload": {
+                            "node_id": node.id,
+                            "entity_type": node.type.value,
+                            "name": node.name,
+                            "summary": node.summary,
+                            "memory_layer": node.memory_layer.value,
+                            "confidence": node.confidence,
+                            "decay_score": node.decay_score,
+                            "access_count": node.access_count,
+                            "created_at": node.created_at.isoformat(),
+                            "updated_at": node.updated_at.isoformat(),
+                            "expires_at": node.expires_at.isoformat() if node.expires_at else None,
+                            "source_episode": node.source_episode,
+                            "created_by": node.created_by,
+                        },
+                    }
+                ],
+            )
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+
+    def _payload_to_node(self, payload: Dict[str, Any]) -> Optional[SynapseNode]:
+        """Convert a Qdrant payload into a SynapseNode."""
+        node_id = payload.get("node_id")
+        entity_type = payload.get("entity_type")
+        name = payload.get("name")
+
+        if node_id is None or entity_type is None or name is None:
+            return None
+
+        return SynapseNode(
+            id=str(node_id),
+            type=EntityType(str(entity_type)),
+            name=str(name),
+            summary=payload.get("summary"),
+            memory_layer=MemoryLayer(str(payload.get("memory_layer", MemoryLayer.SEMANTIC.value))),
+            confidence=float(payload.get("confidence", 0.7)),
+            decay_score=float(payload.get("decay_score", 1.0)),
+            access_count=int(payload.get("access_count", 0)),
+            created_at=self._parse_datetime(payload.get("created_at")) or utcnow(),
+            updated_at=self._parse_datetime(payload.get("updated_at")) or utcnow(),
+            expires_at=self._parse_datetime(payload.get("expires_at")),
+            source_episode=payload.get("source_episode"),
+            created_by=str(payload.get("created_by", "synapse")),
+        )
+
+    def _parse_datetime(self, dt_str: Optional[str]) -> Optional[datetime]:
+        """Parse ISO format datetime string."""
+        if dt_str is None:
+            return None
+
+        if dt_str.endswith('Z'):
+            dt_str = dt_str[:-1] + '+00:00'
+
+        try:
+            return datetime.fromisoformat(dt_str)
+        except ValueError:
+            return None
 
     async def add_entity(
         self,
@@ -110,15 +200,11 @@ class SemanticManager:
         # Preprocess name and summary for Thai
         processed_name = name
         processed_summary = summary
-        entity_metadata = {}
-
         if preprocess:
             preprocessor = _get_nlp_preprocessor()
             if preprocessor:
                 result = preprocessor.preprocess_for_extraction(name)
                 processed_name = result.processed
-                entity_metadata["original_name"] = name
-                entity_metadata["language"] = result.language
 
                 if summary:
                     summary_result = preprocessor.preprocess_for_extraction(summary)
@@ -142,6 +228,7 @@ class SemanticManager:
 
         # TODO: Persist to Graphiti
         # await self._graphiti.add_node(node)
+        self._index_entity(node)
 
         return node
 
@@ -215,26 +302,47 @@ class SemanticManager:
         Returns:
             List of SearchResult
         """
-        await self._ensure_graphiti()
-
         now = utcnow()
+        filters: Dict[str, Any] = {}
+
+        if entity_types:
+            filters["entity_type"] = [entity_type.value for entity_type in entity_types]
+
+        try:
+            matches = self.vector_client.search(
+                collection_name=self.collection_name,
+                query_text=query,
+                limit=max(limit * 3, limit),
+                filters=filters or None,
+            )
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+            return []
+
         results = []
 
-        # Preprocess query for Thai
-        processed_query = query
-        query_metadata = {}
+        for match in matches:
+            node = self._payload_to_node(match["payload"])
+            if node is None:
+                continue
 
-        if preprocess_query:
-            preprocessor = _get_nlp_preprocessor()
-            if preprocessor:
-                processed_query = preprocessor.preprocess_for_search(query)
-                query_metadata["preprocessed"] = True
+            decay_score = self.compute_decay_score(node, now)
+            vector_score = max(0.0, min(1.0, float(match.get("score", 0.0))))
+            combined_score = max(0.0, min(1.0, (vector_score + decay_score) / 2.0))
 
-        # TODO: Implement actual Graphiti search
-        # raw_results = await self._graphiti.search(processed_query, limit=limit * 2)
+            if combined_score < min_score:
+                continue
 
-        # For now, return empty list (placeholder)
-        # Real implementation will query Graphiti and compute decay scores
+            results.append(
+                SearchResult(
+                    node=node,
+                    score=combined_score,
+                    source="vector",
+                )
+            )
+
+            if len(results) >= limit:
+                break
 
         return results
 
@@ -305,8 +413,6 @@ class SemanticManager:
             Updated SynapseNode or None
         """
         await self._ensure_graphiti()
-
-        now = utcnow()
 
         # TODO: Implement actual update
         return None
@@ -387,7 +493,6 @@ class SemanticManager:
         """
         await self._ensure_graphiti()
 
-        now = utcnow()
         count = 0
 
         # TODO: Implement cleanup
