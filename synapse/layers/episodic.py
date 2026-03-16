@@ -789,6 +789,63 @@ class EpisodicManager:
                 for row in rows
             ]
 
+    async def verify_sync(self) -> Dict[str, Any]:
+        """
+        Verify SQLite and Qdrant are in sync.
+
+        Compares episode IDs between SQLite and Qdrant to find
+        any discrepancies that may have occurred due to failed
+        sync operations.
+
+        Returns:
+            Dict with:
+            - in_sync: True if both stores match
+            - sqlite_count: Number of episodes in SQLite
+            - qdrant_count: Number of episodes in Qdrant
+            - only_in_sqlite: IDs in SQLite but not Qdrant
+            - only_in_qdrant: IDs in Qdrant but not SQLite
+        """
+        with self._get_connection() as conn:
+            # Get all episode IDs from SQLite
+            sqlite_rows = conn.execute("SELECT id FROM episodes").fetchall()
+            sqlite_ids = {row["id"] for row in sqlite_rows}
+
+        # Get all episode IDs from Qdrant
+        qdrant_ids = set()
+        if self.vector_client:
+            try:
+                # Scroll through all points in collection
+                offset = None
+                while True:
+                    results = self.vector_client.scroll(
+                        collection_name=self.collection_name,
+                        limit=100,
+                        offset=offset,
+                    )
+                    if not results or not results[0]:
+                        break
+
+                    points, offset = results
+                    qdrant_ids.update(str(p.id) for p in points)
+
+                    if offset is None:
+                        break
+
+            except Exception as e:
+                logger.error(f"Failed to get Qdrant IDs: {e}")
+
+        # Find discrepancies
+        only_sqlite = sqlite_ids - qdrant_ids
+        only_qdrant = qdrant_ids - sqlite_ids
+
+        return {
+            "in_sync": len(only_sqlite) == 0 and len(only_qdrant) == 0,
+            "sqlite_count": len(sqlite_ids),
+            "qdrant_count": len(qdrant_ids),
+            "only_in_sqlite": list(only_sqlite),
+            "only_in_qdrant": list(only_qdrant),
+        }
+
     def extend_episode_ttl(
         self,
         episode_id: str,
