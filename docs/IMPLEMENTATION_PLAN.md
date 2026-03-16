@@ -160,16 +160,16 @@ Done: 50%        Done: 0%         Done: 0%         Done: 0%         Done: 0%
 
 #### Task 2.2: Create Storage Clients
 
-**Goal:** สร้าง client สำหรับ FalkorDB + ChromaDB
+**Goal:** สร้าง client สำหรับ FalkorDB + Qdrant
 
 **Files to create:**
 - `synapse/storage/falkordb.py`
-- `synapse/storage/chromadb.py`
+- `synapse/storage/qdrant_client.py`
 - `synapse/storage/sqlite.py`
 
 **Functions:**
 - `FalkorDBClient`: connect, query, close
-- `ChromaDBClient`: connect, add, search, delete
+- `QdrantClient`: connect, add, search, delete
 - `SQLiteClient`: connect, execute, close
 
 #### Task 2.3: Integrate Memory Layers with Graph
@@ -205,7 +205,7 @@ Already in Graphiti! ✅
 |------|-------------|
 | `docs/GRAPHITI_NOTES.md` | Architecture notes |
 | `synapse/storage/falkordb.py` | Graph DB client |
-| `synapse/storage/chromadb.py` | Vector DB client |
+| `synapse/storage/qdrant_client.py` | Vector DB client |
 | `synapse/layers/classifier.py` | Layer auto-detection |
 | Modified graphiti files | + memory_layer field |
 
@@ -260,7 +260,7 @@ Already in Graphiti! ✅
 
 **Storage:**
 - Graph: `(Procedure)` nodes with trigger edges
-- Vector: ChromaDB for semantic search
+- Vector: Qdrant for semantic search
 
 **Behavior:**
 - Slow decay (λ = 0.005, half-life ~139 days)
@@ -292,7 +292,7 @@ Already in Graphiti! ✅
 
 **Storage:**
 - Graph: `(Episode)` nodes with `expires_at`
-- Vector: ChromaDB for semantic search
+- Vector: Qdrant for semantic search
 
 **Behavior:**
 - TTL: 90 days
@@ -466,7 +466,7 @@ if detect_thai(query):
 **Services:**
 - `synapse` (MCP server)
 - `falkordb` (graph database)
-- `chromadb` (vector database)
+- `qdrant` (vector database)
 - `thai-nlp` (optional sidecar)
 
 #### Task 5.3: Integrate with JellyCore

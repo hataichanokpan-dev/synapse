@@ -1,5 +1,8 @@
 # Synapse Development Workflow
 
+> **Note**: This document may contain outdated references to ChromaDB.
+> The current implementation uses **Qdrant** as the vector database.
+
 ## Overview
 
 แต่ละ Phase จะมี workflow ดังนี้:

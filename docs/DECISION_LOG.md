@@ -3,6 +3,9 @@
 **Created:** 2026-03-13
 **Status:** Approved
 
+> **Note**: This document may contain outdated references to ChromaDB.
+> The current implementation uses **Qdrant** as the vector database.
+
 ---
 
 ## Decision: Fork Graphiti + Inject Oracle-v2 (Option E)

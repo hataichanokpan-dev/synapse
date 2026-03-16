@@ -189,7 +189,7 @@ Synapse เป็นโปรเจคสร้างระบบสมองห
 │                                                                             │
 │   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                 │
 │   │              │    │              │    │              │                 │
-│   │   FalkorDB   │    │  ChromaDB    │    │   SQLite     │                 │
+│   │   FalkorDB   │    │   Qdrant     │    │   SQLite     │                 │
 │   │   (Graph)    │    │  (Vector)    │    │  (Metadata)  │                 │
 │   │              │    │              │    │              │                 │
 │   │ • Nodes      │    │ • Embeddings │    │ • User Model │                 │
@@ -230,7 +230,7 @@ Synapse เป็นโปรเจคสร้างระบบสมองห
 │   • Success count tracking                                                  │
 │                                                                             │
 │   → Decay: SLOW (λ = 0.005, half-life ~139 days)                           │
-│   → Storage: FalkorDB + ChromaDB                                            │
+│   → Storage: FalkorDB + Qdrant                                              │
 │   → Graph: (Procedure) nodes with trigger edges                            │
 │                                                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -242,7 +242,7 @@ Synapse เป็นโปรเจคสร้างระบบสมองห
 │   • Learnings (facts discovered)                                           │
 │                                                                             │
 │   → Decay: NORMAL (λ = 0.01, half-life ~69 days)                           │
-│   → Storage: FalkorDB + ChromaDB                                            │
+│   → Storage: FalkorDB + Qdrant                                              │
 │   → Graph: Entity nodes + Fact edges                                        │
 │                                                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -254,7 +254,7 @@ Synapse เป็นโปรเจคสร้างระบบสมองห
 │   • Session context                                                         │
 │                                                                             │
 │   → Decay: TTL-based (90 days, extendable on access)                       │
-│   → Storage: FalkorDB + ChromaDB                                            │
+│   → Storage: FalkorDB + Qdrant                                              │
 │   → Graph: Episode nodes with temporal edges                               │
 │                                                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -580,7 +580,7 @@ class RealtimeIndexer:
 |-----------|-----------|-------|
 | **Language** | Python 3.10+ | Graphiti base |
 | **Graph DB** | FalkorDB | Redis-based, easy setup |
-| **Vector DB** | ChromaDB | Built into Graphiti |
+| **Vector DB** | Qdrant | High performance, Rust-based |
 | **Embedding** | multilingual-e5-large | Better Thai support |
 | **NLP** | Thai Sidecar | From Oracle-v2 |
 | **MCP** | MCP SDK v1.x | Streamable HTTP |
