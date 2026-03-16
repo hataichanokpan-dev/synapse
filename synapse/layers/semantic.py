@@ -2,7 +2,7 @@
 Layer 3: Semantic Memory
 
 Principles, patterns, and learnings.
-NORMAL DECAY - λ = 0.01, half-life ~69 days
+NORMAL DECAY - lambda = 0.01, half-life ~69 days
 
 Storage:
 - Graph: Entity nodes + Fact edges (via Graphiti)
@@ -226,9 +226,22 @@ class SemanticManager:
             source_episode=source_episode,
         )
 
-        # TODO: Persist to Graphiti
-        # await self._graphiti.add_node(node)
+        # Index to Qdrant (existing)
         self._index_entity(node)
+
+        # Persist to Graphiti/FalkorDB
+        if self._graphiti is not None:
+            try:
+                # Use add_episode to let LLM extract entity
+                episode_content = f"{processed_name}: {processed_summary or ''}"
+                await self._graphiti.add_episode(
+                    name=f"entity_{processed_name}",
+                    episode_body=episode_content,
+                    source_description=f"Entity type: {entity_type.value}",
+                )
+                logger.debug(f"Entity '{processed_name}' persisted to Graphiti")
+            except Exception as e:
+                logger.warning(f"Failed to persist entity to Graphiti: {e}")
 
         return node
 
@@ -274,8 +287,21 @@ class SemanticManager:
             metadata=metadata or {},
         )
 
-        # TODO: Persist to Graphiti
-        # await self._graphiti.add_edge(edge)
+        # Persist to Graphiti/FalkorDB
+        if self._graphiti is not None:
+            try:
+                # Use add_episode to let LLM extract relationship
+                episode_content = f"{source_id} {relation_type.value} {target_id}"
+                if metadata:
+                    episode_content += f" | {metadata}"
+                await self._graphiti.add_episode(
+                    name=f"fact_{edge_id}",
+                    episode_body=episode_content,
+                    source_description=f"Fact: {relation_type.value}",
+                )
+                logger.debug(f"Fact '{edge_id}' persisted to Graphiti")
+            except Exception as e:
+                logger.warning(f"Failed to persist fact to Graphiti: {e}")
 
         return edge
 
@@ -360,7 +386,53 @@ class SemanticManager:
         """
         await self._ensure_graphiti()
 
-        # TODO: Implement actual Graphiti query
+        # First try to get from Qdrant vector store
+        try:
+            matches = self.vector_client.search(
+                collection_name=self.collection_name,
+                query_text=entity_id,
+                limit=1,
+            )
+            if matches:
+                node = self._payload_to_node(matches[0]["payload"])
+                if node and node.id == entity_id:
+                    # Increment access count
+                    node.access_count += 1
+                    node.updated_at = utcnow()
+                    self._index_entity(node)  # Update in Qdrant
+                    return node
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+
+        # Try to get from Graphiti if available
+        if self._graphiti is not None:
+            try:
+                # Search for the entity in Graphiti
+                results = await self._graphiti.search(
+                    query=entity_id,
+                    num_results=1,
+                )
+                if results:
+                    # Convert Graphiti result to SynapseNode
+                    edge = results[0]
+                    # Extract entity name from the fact
+                    fact_text = getattr(edge, 'fact', '') or str(edge)
+                    # Create a SynapseNode from the result
+                    return SynapseNode(
+                        id=entity_id,
+                        type=EntityType.CONCEPT,
+                        name=entity_id,
+                        summary=fact_text,
+                        memory_layer=MemoryLayer.SEMANTIC,
+                        confidence=0.7,
+                        decay_score=1.0,
+                        access_count=1,
+                        created_at=utcnow(),
+                        updated_at=utcnow(),
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to get entity from Graphiti: {e}")
+
         return None
 
     async def supersede_fact(
@@ -384,14 +456,36 @@ class SemanticManager:
 
         now = utcnow()
 
-        # Mark old edge as invalid
-        # TODO: await self._graphiti.update_edge(old_edge_id, invalid_at=now)
+        # Mark old edge as invalid by adding a superseding fact
+        if self._graphiti is not None:
+            try:
+                # Add an episode marking the old fact as invalid
+                invalidation_content = f"Fact {old_edge_id} is no longer valid as of {now.isoformat()}"
+                await self._graphiti.add_episode(
+                    name=f"invalidate_{old_edge_id}",
+                    episode_body=invalidation_content,
+                    source_description="Fact invalidation",
+                )
+                logger.debug(f"Fact '{old_edge_id}' marked as invalid in Graphiti")
+            except Exception as e:
+                logger.warning(f"Failed to mark old fact as invalid: {e}")
 
         # Create new edge
         new_edge.valid_at = now
         new_edge.metadata["supersedes"] = old_edge_id
 
-        # TODO: await self._graphiti.add_edge(new_edge)
+        # Persist new edge to Graphiti
+        if self._graphiti is not None:
+            try:
+                episode_content = f"{new_edge.source_id} {new_edge.type.value} {new_edge.target_id}"
+                await self._graphiti.add_episode(
+                    name=f"fact_{new_edge.id}",
+                    episode_body=episode_content,
+                    source_description=f"Superseding fact: {new_edge.type.value}",
+                )
+                logger.debug(f"New fact '{new_edge.id}' persisted to Graphiti")
+            except Exception as e:
+                logger.warning(f"Failed to persist new fact to Graphiti: {e}")
 
         return new_edge
 
@@ -414,8 +508,41 @@ class SemanticManager:
         """
         await self._ensure_graphiti()
 
-        # TODO: Implement actual update
-        return None
+        # Get existing entity from Qdrant
+        node = await self.get_entity(entity_id)
+        if node is None:
+            return None
+
+        # Update properties
+        if summary is not None:
+            if node.summary:
+                node.summary = f"{node.summary}\n{summary}"
+            else:
+                node.summary = summary
+
+        if confidence is not None:
+            node.confidence = max(0.0, min(1.0, confidence))
+
+        node.updated_at = utcnow()
+        node.access_count += 1
+
+        # Update in Qdrant
+        self._index_entity(node)
+
+        # Persist update to Graphiti
+        if self._graphiti is not None:
+            try:
+                episode_content = f"Updated {node.name}: {summary or ''}"
+                await self._graphiti.add_episode(
+                    name=f"update_{entity_id}",
+                    episode_body=episode_content,
+                    source_description=f"Entity update: {node.type.value}",
+                )
+                logger.debug(f"Entity '{entity_id}' update persisted to Graphiti")
+            except Exception as e:
+                logger.warning(f"Failed to persist entity update to Graphiti: {e}")
+
+        return node
 
     def compute_decay_score(
         self,
@@ -478,8 +605,58 @@ class SemanticManager:
         """
         await self._ensure_graphiti()
 
-        # TODO: Implement graph traversal
-        return []
+        related: List[SynapseNode] = []
+
+        # Use Graphiti search for graph traversal
+        if self._graphiti is not None:
+            try:
+                # Build query for related entities
+                query = f"related to {entity_id}"
+                if relation_types:
+                    query += " " + " ".join(rt.value for rt in relation_types)
+
+                results = await self._graphiti.search(
+                    query=query,
+                    num_results=limit * max_depth,
+                )
+
+                for edge in results:
+                    # Extract related entity from the fact
+                    fact_text = getattr(edge, 'fact', '') or str(edge)
+                    source_uuid = getattr(edge, 'source_node_uuid', None)
+                    target_uuid = getattr(edge, 'target_node_uuid', None)
+
+                    # Determine the related entity ID
+                    related_id = target_uuid if source_uuid == entity_id else source_uuid
+                    if related_id is None:
+                        continue
+
+                    # Skip if already in results
+                    if related_id in [n.id for n in related]:
+                        continue
+
+                    # Create a SynapseNode for the related entity
+                    node = SynapseNode(
+                        id=related_id,
+                        type=EntityType.CONCEPT,
+                        name=related_id,
+                        summary=fact_text,
+                        memory_layer=MemoryLayer.SEMANTIC,
+                        confidence=0.7,
+                        decay_score=1.0,
+                        access_count=1,
+                        created_at=utcnow(),
+                        updated_at=utcnow(),
+                    )
+                    related.append(node)
+
+                    if len(related) >= limit:
+                        break
+
+            except Exception as e:
+                logger.warning(f"Graph traversal failed: {e}")
+
+        return related
 
     async def cleanup_forgotten(self, batch_size: int = 100) -> int:
         """
@@ -494,11 +671,41 @@ class SemanticManager:
         await self._ensure_graphiti()
 
         count = 0
+        now = utcnow()
 
-        # TODO: Implement cleanup
-        # 1. Find nodes with decay_score < threshold
-        # 2. Archive before deletion (optional)
-        # 3. Delete from graph and vector store
+        # Scan Qdrant for forgotten nodes
+        try:
+            # Get all nodes (this is a simplified approach)
+            # In production, you'd use scroll/iterator
+            all_matches = self.vector_client.search(
+                collection_name=self.collection_name,
+                query_text="",  # Empty query to get all
+                limit=batch_size * 10,
+            )
+
+            for match in all_matches:
+                node = self._payload_to_node(match["payload"])
+                if node is None:
+                    continue
+
+                # Check if node should be forgotten
+                if await self.should_forget_node(node, now):
+                    # Delete from Qdrant
+                    try:
+                        self.vector_client.delete(
+                            collection_name=self.collection_name,
+                            ids=[node.id],
+                        )
+                        count += 1
+                        logger.debug(f"Forgotten node '{node.id}' removed from Qdrant")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete node '{node.id}': {e}")
+
+                    if count >= batch_size:
+                        break
+
+        except Exception as exc:
+            self._warn_vector_issue(exc)
 
         return count
 
