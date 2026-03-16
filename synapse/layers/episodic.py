@@ -120,6 +120,32 @@ class EpisodicManager:
                 USING fts5(content_fts, summary_fts, content='episodes', content_rowid='rowid')
             """)
 
+            # Archive table for deleted episodes (same schema + archived_at)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS episodes_archive (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    content_fts TEXT,
+                    summary TEXT,
+                    summary_fts TEXT,
+                    topics TEXT DEFAULT '[]',
+                    outcome TEXT DEFAULT 'unknown',
+                    memory_layer TEXT DEFAULT 'episodic',
+                    recorded_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    user_id TEXT,
+                    session_id TEXT,
+                    access_count INTEGER DEFAULT 0,
+                    archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Index for archive queries
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_archive_archived_at
+                ON episodes_archive(archived_at)
+            """)
+
             # Migration: Add FTS columns if not exists
             try:
                 conn.execute("ALTER TABLE episodes ADD COLUMN content_fts TEXT")
@@ -610,18 +636,24 @@ class EpisodicManager:
 
         return episodes
 
-    def purge_expired(self, archive: bool = True) -> int:
+    def purge_expired(
+        self,
+        archive: bool = True,
+        archive_retention_days: int = 365,
+    ) -> Dict[str, int]:
         """
-        Remove expired episodes.
+        Remove expired episodes, optionally archiving them first.
 
         Args:
-            archive: If True, archive before deletion
+            archive: If True, archive before deletion (default: True)
+            archive_retention_days: Days to keep archived data (default: 365)
 
         Returns:
-            Number of episodes removed
+            Dict with 'deleted' and 'archived' counts
         """
         now = utcnow()
-        count = 0
+        deleted_count = 0
+        archived_count = 0
 
         with self._get_connection() as conn:
             # Find expired episodes
@@ -632,16 +664,130 @@ class EpisodicManager:
             expired = cursor.fetchall()
 
             for row in expired:
+                episode_id = str(row["id"])
+
                 if archive:
-                    # TODO: Archive to separate table or file
-                    # For now, just log
-                    pass
+                    # Archive before delete
+                    try:
+                        conn.execute("""
+                            INSERT INTO episodes_archive
+                            (id, content, content_fts, summary, summary_fts, topics, outcome,
+                             memory_layer, recorded_at, expires_at, user_id, session_id, access_count)
+                            SELECT id, content, content_fts, summary, summary_fts, topics, outcome,
+                                   memory_layer, recorded_at, expires_at, user_id, session_id, access_count
+                            FROM episodes
+                            WHERE id = ?
+                        """, (episode_id,))
+                        archived_count += 1
+                        logger.info(f"Archived episode: {episode_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to archive episode {episode_id}: {e}")
+                        continue
 
-                conn.execute("DELETE FROM episodes WHERE id = ?", (row["id"],))
-                self._delete_from_vector_store(str(row["id"]))
-                count += 1
+                # Delete from main table
+                conn.execute("DELETE FROM episodes WHERE id = ?", (episode_id,))
+                self._delete_from_vector_store(episode_id)
+                deleted_count += 1
 
-        return count
+            # Clean up old archives (beyond retention period)
+            if archive and archived_count > 0:
+                cutoff = (now - timedelta(days=archive_retention_days)).isoformat()
+                conn.execute("""
+                    DELETE FROM episodes_archive
+                    WHERE datetime(archived_at) < datetime(?)
+                """, (cutoff,))
+
+        return {
+            "deleted": deleted_count,
+            "archived": archived_count,
+        }
+
+    def restore_episode(self, episode_id: str) -> Optional[SynapseEpisode]:
+        """
+        Restore an archived episode.
+
+        Restores the episode to the main table with a new expiry date
+        (90 days from now) and re-indexes it to the vector store.
+
+        Args:
+            episode_id: ID of archived episode
+
+        Returns:
+            Restored SynapseEpisode or None if not found
+        """
+        with self._get_connection() as conn:
+            # Find in archive
+            row = conn.execute(
+                "SELECT * FROM episodes_archive WHERE id = ?",
+                (episode_id,)
+            ).fetchone()
+
+            if not row:
+                logger.warning(f"Episode not found in archive: {episode_id}")
+                return None
+
+            # Restore to main table with new expiry
+            try:
+                conn.execute("""
+                    INSERT INTO episodes
+                    (id, content, content_fts, summary, summary_fts, topics, outcome,
+                     memory_layer, recorded_at, expires_at, user_id, session_id, access_count)
+                    SELECT id, content, content_fts, summary, summary_fts, topics, outcome,
+                           memory_layer, recorded_at, datetime('now', '+90 days'),
+                           user_id, session_id, access_count
+                    FROM episodes_archive
+                    WHERE id = ?
+                """, (episode_id,))
+
+                # Remove from archive
+                conn.execute("DELETE FROM episodes_archive WHERE id = ?", (episode_id,))
+
+            except Exception as e:
+                logger.error(f"Failed to restore episode {episode_id}: {e}")
+                return None
+
+        # Re-index to vector store
+        episode = self._row_to_episode(row)
+        self._index_episode(episode, access_count=row["access_count"])
+
+        logger.info(f"Restored episode: {episode_id}")
+        return episode
+
+    def list_archived(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        List archived episodes.
+
+        Args:
+            limit: Maximum results (default: 100)
+            offset: Offset for pagination (default: 0)
+
+        Returns:
+            List of archived episode dicts with id, content, summary, archived_at
+        """
+        with self._get_connection() as conn:
+            rows = conn.execute("""
+                SELECT id, content, summary, topics, outcome, recorded_at, archived_at
+                FROM episodes_archive
+                ORDER BY archived_at DESC
+                LIMIT ? OFFSET ?
+            """, (limit, offset)).fetchall()
+
+            return [
+                {
+                    "id": row["id"],
+                    "content": row["content"],
+                    "summary": row["summary"],
+                    "topics": json.loads(row["topics"]),
+                    "outcome": row["outcome"],
+                    "recorded_at": row["recorded_at"],
+                    "archived_at": row["archived_at"],
+                }
+                for row in rows
+            ]
 
     def extend_episode_ttl(
         self,
@@ -790,6 +936,6 @@ def find_episodes(query: Optional[str] = None, limit: int = 10, **kwargs) -> Lis
     return get_manager().find_episodes(query=query, limit=limit, **kwargs)
 
 
-def purge_expired(archive: bool = True) -> int:
-    """Remove expired episodes."""
+def purge_expired(archive: bool = True) -> Dict[str, int]:
+    """Remove expired episodes, optionally archiving them first."""
     return get_manager().purge_expired(archive)
