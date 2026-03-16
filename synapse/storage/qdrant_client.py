@@ -8,9 +8,15 @@ applies Thai-aware preprocessing before points are embedded and indexed.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 from typing import Any, Sequence
+
+# Default multilingual embedding model with good Thai support
+DEFAULT_EMBEDDING_MODEL = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
+
+_logger = logging.getLogger(__name__)
 
 
 class QdrantClient:
@@ -300,16 +306,22 @@ class QdrantClient:
         return [float(value) for value in vector]
 
     def _load_embedder(self) -> Any | None:
-        """Optionally load Sentence Transformers when configured."""
+        """Load Sentence Transformers embedder.
+
+        Uses configured model if provided, otherwise falls back to default
+        multilingual model with Thai support.
+        """
         if self._embedder_loaded:
             return self._embedder
 
         self._embedder_loaded = True
 
         model_name = (self.embedding_model or '').strip()
+        using_default = False
+
         if not model_name:
-            self._embedder = None
-            return None
+            model_name = DEFAULT_EMBEDDING_MODEL
+            using_default = True
 
         try:
             from sentence_transformers import SentenceTransformer
@@ -318,8 +330,20 @@ class QdrantClient:
             dimension = self._embedder.get_sentence_embedding_dimension()
             if dimension:
                 self.vector_size = int(dimension)
-        except Exception:
+
+            if using_default:
+                _logger.warning(
+                    "No embedding model configured, using default: %s. "
+                    "Set SYNAPSE_QDRANT_EMBEDDING_MODEL env var for better performance.",
+                    DEFAULT_EMBEDDING_MODEL
+                )
+        except Exception as exc:
             self._embedder = None
+            _logger.warning(
+                "Failed to load embedding model '%s': %s. "
+                "Falling back to hash-based embeddings.",
+                model_name, exc
+            )
 
         return self._embedder
 

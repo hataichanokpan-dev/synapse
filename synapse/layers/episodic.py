@@ -130,11 +130,6 @@ class EpisodicManager:
             except sqlite3.OperationalError:
                 pass
 
-            # FTS5 for full-text search on summaries
-            conn.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts
-                USING fts5(summary, content='episodes', content_rowid='rowid')
-            """)
 
     @contextmanager
     def _get_connection(self):

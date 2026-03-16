@@ -212,6 +212,7 @@ class LayerManager:
         query: str,
         layers: Optional[List[MemoryLayer]] = None,
         limit_per_layer: int = 5,
+        user_id: Optional[str] = None,
     ) -> Dict[MemoryLayer, List[Any]]:
         """
         Search across multiple layers.
@@ -220,18 +221,24 @@ class LayerManager:
             query: Search query
             layers: Layers to search (default: all)
             limit_per_layer: Results per layer
+            user_id: User ID for USER_MODEL layer search
 
         Returns:
             Dict mapping layer to results
         """
         if layers is None:
             layers = [
+                MemoryLayer.USER_MODEL,
                 MemoryLayer.PROCEDURAL,
                 MemoryLayer.SEMANTIC,
                 MemoryLayer.EPISODIC,
+                MemoryLayer.WORKING,
             ]
 
         results: Dict[MemoryLayer, List[Any]] = {}
+
+        if MemoryLayer.USER_MODEL in layers:
+            results[MemoryLayer.USER_MODEL] = self._search_user_model(query, user_id, limit_per_layer)
 
         if MemoryLayer.PROCEDURAL in layers:
             results[MemoryLayer.PROCEDURAL] = self.find_procedures(query, limit_per_layer)
@@ -242,7 +249,121 @@ class LayerManager:
         if MemoryLayer.EPISODIC in layers:
             results[MemoryLayer.EPISODIC] = self.find_episodes_by_topic(query, limit_per_layer)
 
+        if MemoryLayer.WORKING in layers:
+            results[MemoryLayer.WORKING] = self._search_working_memory(query, limit_per_layer)
+
         return results
+
+    def _search_user_model(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search user model for matching preferences, expertise, or topics.
+
+        Args:
+            query: Search query
+            user_id: User ID to search (required for user model)
+            limit: Maximum results
+
+        Returns:
+            List of matching user model attributes
+        """
+        if not user_id:
+            return []
+
+        results = []
+        query_lower = query.lower()
+        user = self.get_user(user_id)
+
+        # Search in expertise
+        for area, level in user.expertise.items():
+            if query_lower in area.lower():
+                results.append({
+                    "type": "expertise",
+                    "area": area,
+                    "level": level,
+                    "relevance": 1.0,
+                })
+
+        # Search in common topics
+        for topic in user.common_topics:
+            if query_lower in topic.lower():
+                results.append({
+                    "type": "topic",
+                    "topic": topic,
+                    "relevance": 0.9,
+                })
+
+        # Search in notes
+        for note in user.notes:
+            if query_lower in note.lower():
+                results.append({
+                    "type": "note",
+                    "note": note,
+                    "relevance": 0.7,
+                })
+
+        return results[:limit]
+
+    def _search_working_memory(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search working memory for matching context values.
+
+        Args:
+            query: Search query
+            limit: Maximum results
+
+        Returns:
+            List of matching working memory entries
+        """
+        results = []
+        query_lower = query.lower()
+
+        # Get all context and search through it
+        all_context = self.working.get_all_context()
+
+        for key, value in all_context.items():
+            # Check if query matches key
+            if query_lower in key.lower():
+                results.append({
+                    "key": key,
+                    "value": value,
+                    "match_type": "key",
+                    "relevance": 1.0,
+                })
+                continue
+
+            # Check if query matches string value
+            if isinstance(value, str) and query_lower in value.lower():
+                results.append({
+                    "key": key,
+                    "value": value,
+                    "match_type": "value",
+                    "relevance": 0.8,
+                })
+                continue
+
+            # Check if query matches list items
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and query_lower in item.lower():
+                        results.append({
+                            "key": key,
+                            "value": value,
+                            "matched_item": item,
+                            "match_type": "list_item",
+                            "relevance": 0.7,
+                        })
+                        break
+
+        return results[:limit]
 
     def get_memory_stats(self) -> Dict[str, Any]:
         """
