@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
 from synapse.storage import QdrantClient as SynapseQdrantClient
+from synapse.services import SynapseService
 
 from config.schema import GraphitiConfig, ServerConfig
 from models.response_types import (
@@ -164,6 +165,7 @@ except Exception as e:
 # Global services
 graphiti_service: Optional['GraphitiService'] = None
 queue_service: QueueService | None = None
+synapse_service: Optional[SynapseService] = None
 
 # Global client for backward compatibility
 graphiti_client: Graphiti | None = None
@@ -374,6 +376,13 @@ async def add_memory(
     This function returns immediately and processes the episode addition in the background.
     Episodes for the same group_id are processed sequentially to avoid race conditions.
 
+    Content is automatically classified into the appropriate memory layer:
+    - USER_MODEL: User preferences and expertise
+    - PROCEDURAL: How-to patterns and procedures
+    - SEMANTIC: Principles, patterns, and learnings
+    - EPISODIC: Conversation summaries
+    - WORKING: Session context
+
     Args:
         name (str): Name of the episode
         episode_body (str): The content of the episode to persist to memory. When source='json', this must be a
@@ -407,7 +416,7 @@ async def add_memory(
             source_description="CRM data"
         )
     """
-    global graphiti_service, queue_service
+    global graphiti_service, queue_service, synapse_service
 
     if graphiti_service is None or queue_service is None:
         return ErrorResponse(error='Services not initialized')
@@ -415,6 +424,22 @@ async def add_memory(
     try:
         # Use the provided group_id or fall back to the default from config
         effective_group_id = group_id or config.graphiti.group_id
+
+        # Use SynapseService for layer classification and routing
+        if synapse_service is not None:
+            result = await synapse_service.add_memory(
+                name=name,
+                episode_body=episode_body,
+                source_description=source_description,
+                group_id=effective_group_id,
+                source=source,
+                uuid=uuid,
+            )
+            detected_layer = result.get("layer", "unknown")
+            logger.info(f"Memory '{name}' classified as layer: {detected_layer}")
+        else:
+            # Fallback to original behavior if SynapseService not available
+            logger.warning("SynapseService not available, using legacy queue")
 
         # Try to parse the source as an EpisodeType enum, with fallback to text
         episode_type = EpisodeType.text  # Default
@@ -426,7 +451,7 @@ async def add_memory(
                 logger.warning(f"Unknown source type '{source}', using 'text' as default")
                 episode_type = EpisodeType.text
 
-        # Submit to queue service for async processing
+        # Submit to queue service for async processing (Graphiti)
         await queue_service.add_episode(
             group_id=effective_group_id,
             name=name,
@@ -578,6 +603,72 @@ async def search_memory_facts(
         error_msg = str(e)
         logger.error(f'Error searching facts: {error_msg}')
         return ErrorResponse(error=f'Error searching facts: {error_msg}')
+
+
+@mcp.tool()
+async def search_memory_layers(
+    query: str,
+    layers: list[str] | None = None,
+    limit: int = 10,
+) -> dict[str, Any] | ErrorResponse:
+    """Search across all memory layers using Synapse layer system.
+
+    This tool searches the 5-layer memory model:
+    - user_model: User preferences and expertise
+    - procedural: How-to patterns and procedures
+    - semantic: Principles, patterns, and learnings
+    - episodic: Conversation summaries
+    - working: Session context
+
+    Args:
+        query: The search query
+        layers: Optional list of layers to search (e.g., ["semantic", "episodic"])
+        limit: Maximum results per layer (default: 10)
+
+    Returns:
+        Dict with results per layer and Graphiti results
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        from synapse.layers import MemoryLayer
+
+        # Convert string layer names to MemoryLayer enums
+        layer_enums = None
+        if layers:
+            layer_enums = []
+            for layer_name in layers:
+                try:
+                    layer_enums.append(MemoryLayer(layer_name.lower()))
+                except ValueError:
+                    logger.warning(f"Unknown layer: {layer_name}")
+
+        results = await synapse_service.search_memory(
+            query=query,
+            layers=layer_enums,
+            limit=limit,
+        )
+
+        return {
+            "message": "Search completed successfully",
+            "query": query,
+            "layers": results["layers"],
+            "graphiti": [
+                {
+                    "fact": getattr(edge, 'fact', str(edge)),
+                    "source_node": getattr(edge, 'source_node_uuid', None),
+                    "target_node": getattr(edge, 'target_node_uuid', None),
+                }
+                for edge in results["graphiti"]
+            ] if results["graphiti"] else [],
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error searching memory layers: {error_msg}')
+        return ErrorResponse(error=f'Error searching memory layers: {error_msg}')
 
 
 @mcp.tool()
@@ -765,7 +856,7 @@ async def clear_graph(group_ids: list[str] | None = None) -> SuccessResponse | E
 @mcp.tool()
 async def get_status() -> StatusResponse:
     """Get the status of the Graphiti MCP server and database connection."""
-    global graphiti_service
+    global graphiti_service, synapse_service
 
     if graphiti_service is None:
         return StatusResponse(status='error', message='Graphiti service not initialized')
@@ -782,9 +873,16 @@ async def get_status() -> StatusResponse:
 
         # Use the provider from the service's config, not the global
         provider_name = graphiti_service.config.database.provider
+
+        # Check SynapseService status
+        synapse_status = "not initialized"
+        if synapse_service is not None:
+            health = await synapse_service.health_check()
+            synapse_status = health.get("status", "unknown")
+
         return StatusResponse(
             status='ok',
-            message=f'Graphiti MCP server is running and connected to {provider_name} database',
+            message=f'Graphiti MCP server is running and connected to {provider_name} database. SynapseService: {synapse_status}',
         )
     except Exception as e:
         error_msg = str(e)
@@ -803,7 +901,7 @@ async def health_check(request) -> JSONResponse:
 
 async def initialize_server() -> ServerConfig:
     """Parse CLI arguments and initialize the Graphiti server configuration."""
-    global config, graphiti_service, queue_service, graphiti_client, qdrant_client, semaphore
+    global config, graphiti_service, queue_service, graphiti_client, qdrant_client, semaphore, synapse_service
 
     parser = argparse.ArgumentParser(
         description='Run the Graphiti MCP server with YAML configuration support'
@@ -934,6 +1032,13 @@ async def initialize_server() -> ServerConfig:
     graphiti_client = await graphiti_service.get_client()
     qdrant_client = graphiti_service.vector_store
     semaphore = graphiti_service.semaphore
+
+    # Initialize SynapseService - bridge between MCP and Layer System
+    synapse_service = SynapseService(
+        graphiti_client=graphiti_client,
+        user_id=config.graphiti.group_id or "default",
+    )
+    logger.info('SynapseService initialized with LayerManager')
 
     # Initialize queue service with the client
     await queue_service.initialize(graphiti_client)
