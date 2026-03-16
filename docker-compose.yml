@@ -58,6 +58,7 @@ services:
     environment:
       # LLM Configuration
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
 
       # Database Configuration
       - FALKORDB_URI=redis://falkordb:6379

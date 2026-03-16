@@ -115,7 +115,6 @@ class SynapseService:
                 name=name,
                 episode_body=episode_body,
                 source_description=source_description,
-                source_url=source_url,
                 reference_time=reference_time,
                 group_id=group_id,
                 source=episode_type,

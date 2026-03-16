@@ -111,10 +111,10 @@ class SemanticManager:
                         "text": "\n".join(part for part in [node.name, node.summary or ""] if part),
                         "payload": {
                             "node_id": node.id,
-                            "entity_type": node.type.value,
+                            "entity_type": node.type.value if hasattr(node.type, 'value') else node.type,
                             "name": node.name,
                             "summary": node.summary,
-                            "memory_layer": node.memory_layer.value,
+                            "memory_layer": node.memory_layer.value if hasattr(node.memory_layer, 'value') else node.memory_layer,
                             "confidence": node.confidence,
                             "decay_score": node.decay_score,
                             "access_count": node.access_count,

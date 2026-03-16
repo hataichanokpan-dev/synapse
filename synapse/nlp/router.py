@@ -89,8 +89,8 @@ class LanguageDetector:
             )
 
         # Count characters by type
-        thai_chars = len(cls.THAI_PATTERN.findall(text))
-        ascii_chars = len(cls.ASCII_PATTERN.findall(text))
+        thai_chars = sum(len(m) for m in cls.THAI_PATTERN.findall(text))
+        ascii_chars = sum(len(m) for m in cls.ASCII_PATTERN.findall(text))
         total_chars = len(text.replace(" ", ""))
 
         if total_chars == 0:
