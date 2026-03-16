@@ -2,15 +2,17 @@
 Layer Manager - Unified Memory API
 
 Manages all five memory layers with:
-- Automatic layer detection
+- Automatic layer detection (LLM-based with keyword fallback)
 - Cross-layer search
 - Decay maintenance
 - Memory consolidation
+- User isolation support
 """
 
+import logging
+import os
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
-from datetime import datetime
-from enum import Enum
 
 from .types import (
     MemoryLayer,
@@ -30,6 +32,9 @@ from .semantic import SemanticManager, search as semantic_search
 from .episodic import EpisodicManager, record_episode, find_episodes
 from .working import WorkingManager, set_context, get_context, clear_context
 from .decay import compute_decay_score, should_forget, DecayConfig
+from .context import UserContext
+
+logger = logging.getLogger(__name__)
 
 
 class LayerManager:
@@ -37,6 +42,7 @@ class LayerManager:
     Unified manager for all five memory layers.
 
     Provides a single API for memory operations across all layers.
+    Supports user isolation via UserContext.
     """
 
     def __init__(
@@ -46,6 +52,9 @@ class LayerManager:
         semantic_manager: Optional[SemanticManager] = None,
         episodic_manager: Optional[EpisodicManager] = None,
         working_manager: Optional[WorkingManager] = None,
+        user_context: Optional[UserContext] = None,
+        user_id: str = "default",
+        llm_client: Optional[object] = None,
     ):
         """
         Initialize Layer Manager.
@@ -56,21 +65,42 @@ class LayerManager:
             semantic_manager: Layer 3 manager
             episodic_manager: Layer 4 manager
             working_manager: Layer 5 manager
+            user_context: UserContext for user isolation (takes precedence)
+            user_id: User identifier (default: "default")
+            llm_client: LLM client for classification
         """
-        # Layer 1: User Model
-        self.user_model = user_model_manager or UserModelManager()
+        # If user_context is provided, use it for all managers
+        if user_context is not None:
+            self.user_model = user_context.user_model
+            self.procedural = user_context.procedural
+            self.semantic = user_context.semantic
+            self.episodic = user_context.episodic
+            self.working = user_context.working
+            self.user_context = user_context
+            self.user_id = user_context.user_id
+        else:
+            # Legacy: use individual managers
+            # Layer 1: User Model
+            self.user_model = user_model_manager or UserModelManager()
 
-        # Layer 2: Procedural
-        self.procedural = procedural_manager or ProceduralManager()
+            # Layer 2: Procedural
+            self.procedural = procedural_manager or ProceduralManager()
 
-        # Layer 3: Semantic
-        self.semantic = semantic_manager or SemanticManager()
+            # Layer 3: Semantic
+            self.semantic = semantic_manager or SemanticManager()
 
-        # Layer 4: Episodic
-        self.episodic = episodic_manager or EpisodicManager()
+            # Layer 4: Episodic
+            self.episodic = episodic_manager or EpisodicManager()
 
-        # Layer 5: Working
-        self.working = working_manager or WorkingManager()
+            # Layer 5: Working
+            self.working = working_manager or WorkingManager()
+
+            self.user_context = None
+            self.user_id = user_id
+
+        # Initialize classifier
+        from synapse.classifiers import LayerClassifier
+        self._classifier = LayerClassifier(llm_client=llm_client, use_llm=True)
 
     # ==================== Layer 1: User Model ====================
 
@@ -175,6 +205,9 @@ class LayerManager:
         """
         Automatically detect appropriate memory layer for content.
 
+        Uses keyword-based classification for sync compatibility.
+        For async LLM-based classification, use detect_layer_async().
+
         Args:
             content: Content to classify
             context: Additional context for classification
@@ -182,30 +215,46 @@ class LayerManager:
         Returns:
             Detected MemoryLayer
         """
-        content_lower = content.lower()
+        import asyncio
+        try:
+            # Try to run async classifier in event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're in an async context, use keyword fallback
+                layer, confidence = self._classifier._classify_with_keywords(content)
+                logger.debug(f"Detected layer: {layer.value} (confidence: {confidence}) [sync fallback]")
+                return layer
+            else:
+                # We can run async
+                layer, confidence = loop.run_until_complete(
+                    self._classifier.classify(content, context)
+                )
+                logger.debug(f"Detected layer: {layer.value} (confidence: {confidence})")
+                return layer
+        except RuntimeError:
+            # No event loop, use keyword fallback
+            layer, confidence = self._classifier._classify_with_keywords(content)
+            logger.debug(f"Detected layer: {layer.value} (confidence: {confidence}) [no event loop]")
+            return layer
 
-        # Layer 1: User Model keywords
-        user_keywords = ["ฉันชอบ", "ผู้ใช้ชอบ", "my preference", "i prefer", "ฉันเป็นผู้เชี่ยวชาญ"]
-        if any(kw in content_lower for kw in user_keywords):
-            return MemoryLayer.USER_MODEL
+    async def detect_layer_async(
+        self,
+        content: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> MemoryLayer:
+        """
+        Async version of detect_layer using LLM when available.
 
-        # Layer 2: Procedural keywords
-        proc_keywords = ["วิธี", "ขั้นตอน", "how to", "steps", "procedure", "ทำอย่างไร"]
-        if any(kw in content_lower for kw in proc_keywords):
-            return MemoryLayer.PROCEDURAL
+        Args:
+            content: Content to classify
+            context: Additional context for classification
 
-        # Layer 4: Episodic keywords
-        epi_keywords = ["เมื่อวาน", "วันนี้", "yesterday", "today", "เกิดขึ้น", "happened", "บทสนทนา"]
-        if any(kw in content_lower for kw in epi_keywords):
-            return MemoryLayer.EPISODIC
-
-        # Layer 5: Working (temporary) keywords
-        work_keywords = ["ชั่วคราว", "ตอนนี้", "temp", "now", "current", "session"]
-        if context and context.get("temporary"):
-            return MemoryLayer.WORKING
-
-        # Default: Semantic
-        return MemoryLayer.SEMANTIC
+        Returns:
+            Detected MemoryLayer
+        """
+        layer, confidence = await self._classifier.classify(content, context)
+        logger.debug(f"Detected layer: {layer.value} (confidence: {confidence}) [async]")
+        return layer
 
     async def search_all(
         self,
@@ -456,13 +505,68 @@ class LayerManager:
         return "\n".join(parts)
 
 
-# Singleton instance
+# User-isolated contexts
+_contexts: Dict[str, UserContext] = {}
+_default_context: Optional[UserContext] = None
+
+# Feature flag for user isolation
+_USER_ISOLATION_ENABLED = os.getenv("SYNAPSE_USE_USER_ISOLATION", "false").lower() == "true"
+
+
+def get_layer_manager(user_id: str = "default", llm_client: Optional[object] = None) -> LayerManager:
+    """
+    Get LayerManager for specific user.
+
+    When SYNAPSE_USE_USER_ISOLATION=true, each user gets isolated storage.
+    When false, all users share the default manager (backward compatible).
+
+    Args:
+        user_id: User identifier (default: "default")
+        llm_client: LLM client for classification
+
+    Returns:
+        LayerManager instance for the user
+    """
+    global _default_context
+
+    if not _USER_ISOLATION_ENABLED:
+        # Legacy mode: single global manager
+        global _manager
+        if _manager is None:
+            _manager = LayerManager(llm_client=llm_client)
+        return _manager
+
+    # User isolation mode
+    if user_id == "default" and _default_context is not None:
+        return LayerManager(user_context=_default_context, llm_client=llm_client)
+
+    if user_id not in _contexts:
+        _contexts[user_id] = UserContext.create(user_id)
+        if user_id == "default":
+            _default_context = _contexts[user_id]
+
+    return LayerManager(user_context=_contexts[user_id], llm_client=llm_client)
+
+
+def clear_user_context(user_id: str) -> bool:
+    """
+    Clear context for a user (for testing/cleanup).
+
+    Args:
+        user_id: User identifier
+
+    Returns:
+        True if context was cleared, False if not found
+    """
+    global _default_context
+
+    if user_id in _contexts:
+        del _contexts[user_id]
+        if user_id == "default":
+            _default_context = None
+        return True
+    return False
+
+
+# Legacy singleton instance (for backward compatibility)
 _manager: Optional[LayerManager] = None
-
-
-def get_layer_manager() -> LayerManager:
-    """Get singleton LayerManager instance."""
-    global _manager
-    if _manager is None:
-        _manager = LayerManager()
-    return _manager
