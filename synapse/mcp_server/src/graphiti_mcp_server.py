@@ -1095,6 +1095,146 @@ async def clear_working_context(
         return ErrorResponse(error=f'Error clearing working context: {error_msg}')
 
 
+# ============================================
+# IDENTITY MANAGEMENT TOOLS
+# ============================================
+
+@mcp.tool()
+async def set_identity(
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    chat_id: str | None = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Set identity context for memory operations.
+
+    The identity hierarchy determines memory isolation:
+    - user_id: User-level preferences (persists across agents/chats)
+    - agent_id: Agent-specific context (shared across chats)
+    - chat_id: Chat-specific context (isolated per conversation)
+
+    Use this to switch between different users, agents, or conversations.
+    All subsequent memory operations will use this identity context.
+
+    Args:
+        user_id: User identifier (required for first call)
+        agent_id: Agent identifier (optional, for multi-agent support)
+        chat_id: Chat/conversation identifier (optional, for isolation)
+
+    Returns:
+        Current identity context with all fields
+
+    Example:
+        # Set user context
+        result = await set_identity(user_id="alice")
+
+        # Switch to a specific agent for this user
+        result = await set_identity(agent_id="claude")
+
+        # Start a new chat conversation
+        result = await set_identity(chat_id="chat_abc123")
+
+        # Full identity at once
+        result = await set_identity(
+            user_id="alice",
+            agent_id="claude",
+            chat_id="chat_abc123"
+        )
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        result = synapse_service.set_identity(
+            user_id=user_id,
+            agent_id=agent_id,
+            chat_id=chat_id,
+        )
+
+        return {
+            "message": "Identity context updated",
+            "identity": result,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error setting identity: {error_msg}')
+        return ErrorResponse(error=f'Error setting identity: {error_msg}')
+
+
+@mcp.tool()
+async def get_identity() -> dict[str, Any] | ErrorResponse:
+    """Get current identity context.
+
+    Returns the current user_id, agent_id, and chat_id being used
+    for memory operations. This determines which user model and
+    memory context is active.
+
+    Returns:
+        Current identity context:
+        - user_id: Active user identifier
+        - agent_id: Active agent identifier (or null)
+        - chat_id: Active chat identifier (or null)
+
+    Example:
+        result = await get_identity()
+        print(f"User: {result['user_id']}")
+        print(f"Agent: {result['agent_id']}")
+        print(f"Chat: {result['chat_id']}")
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        result = synapse_service.get_identity()
+
+        return {
+            "message": "Current identity context",
+            "identity": result,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error getting identity: {error_msg}')
+        return ErrorResponse(error=f'Error getting identity: {error_msg}')
+
+
+@mcp.tool()
+async def clear_identity() -> dict[str, Any] | ErrorResponse:
+    """Clear agent and chat identity context.
+
+    Resets agent_id and chat_id to null, keeping only user_id.
+    Use this when switching from a specific agent/chat back to
+    the base user context.
+
+    Returns:
+        Previous identity context (before clearing)
+
+    Example:
+        # Clear agent and chat context, keep user
+        previous = await clear_identity()
+        # Now operating as base user
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        previous = synapse_service.clear_identity()
+
+        return {
+            "message": "Identity context cleared (agent_id, chat_id reset)",
+            "previous_identity": previous,
+            "current_identity": synapse_service.get_identity(),
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error clearing identity: {error_msg}')
+        return ErrorResponse(error=f'Error clearing identity: {error_msg}')
+
+
 @mcp.tool()
 async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
     """Delete an entity edge from the graph memory.

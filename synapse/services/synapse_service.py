@@ -36,6 +36,8 @@ class SynapseService:
         graphiti_client: Any,
         layer_manager: Optional[LayerManager] = None,
         user_id: str = "default",
+        agent_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
     ):
         """
         Initialize SynapseService.
@@ -44,10 +46,90 @@ class SynapseService:
             graphiti_client: Graphiti client for knowledge graph operations
             layer_manager: Optional LayerManager instance (created if not provided)
             user_id: User identifier for isolation
+            agent_id: Optional agent identifier for multi-agent support
+            chat_id: Optional chat/conversation identifier
         """
         self.graphiti = graphiti_client
         self.layers = layer_manager or LayerManager()
         self.user_id = user_id
+        self.agent_id = agent_id
+        self.chat_id = chat_id
+
+    # ============================================
+    # IDENTITY MANAGEMENT
+    # ============================================
+
+    def set_identity(
+        self,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+    ) -> Dict[str, Optional[str]]:
+        """
+        Set identity context for memory operations.
+
+        The identity hierarchy determines memory isolation:
+        - user_id: User-level preferences (persists across agents/chats)
+        - agent_id: Agent-specific context (shared across chats)
+        - chat_id: Chat-specific context (isolated per conversation)
+
+        Args:
+            user_id: User identifier (required for first call)
+            agent_id: Agent identifier (optional, for multi-agent)
+            chat_id: Chat/conversation identifier (optional)
+
+        Returns:
+            Current identity context
+        """
+        if user_id is not None:
+            self.user_id = user_id
+        if agent_id is not None:
+            self.agent_id = agent_id
+        if chat_id is not None:
+            self.chat_id = chat_id
+
+        return self.get_identity()
+
+    def get_identity(self) -> Dict[str, Optional[str]]:
+        """
+        Get current identity context.
+
+        Returns:
+            Dict with user_id, agent_id, chat_id
+        """
+        return {
+            "user_id": self.user_id,
+            "agent_id": self.agent_id,
+            "chat_id": self.chat_id,
+        }
+
+    def get_full_user_key(self) -> str:
+        """
+        Get composite key for user model lookup.
+
+        Format: user_id[:agent_id[:chat_id]]
+
+        Returns:
+            Composite key string
+        """
+        parts = [self.user_id]
+        if self.agent_id:
+            parts.append(self.agent_id)
+            if self.chat_id:
+                parts.append(self.chat_id)
+        return ":".join(parts)
+
+    def clear_identity(self) -> Dict[str, Optional[str]]:
+        """
+        Clear identity context (reset to defaults).
+
+        Returns:
+            Previous identity context
+        """
+        previous = self.get_identity()
+        self.agent_id = None
+        self.chat_id = None
+        return previous
 
     # ============================================
     # MEMORY OPERATIONS (High-level API)
@@ -332,10 +414,22 @@ class SynapseService:
     # ============================================
 
     def get_user_context(self) -> Dict[str, Any]:
-        """Get current user context."""
-        user = self.layers.get_user(self.user_id)
+        """Get current user context with identity hierarchy."""
+        # Try to get specific user model (with agent/chat context)
+        user = self.layers.get_user(self.get_full_user_key())
+
+        # If not found and we have agent/chat context, fallback to base user
+        if user is None and (self.agent_id or self.chat_id):
+            user = self.layers.get_user(self.user_id)
+
+        # If still not found, create default
+        if user is None:
+            user = self.layers.get_user(self.user_id)
+
         return {
             "user_id": user.user_id,
+            "agent_id": getattr(user, 'agent_id', self.agent_id),
+            "chat_id": getattr(user, 'chat_id', self.chat_id),
             "language": user.language,
             "response_style": user.response_style,
             "response_length": user.response_length,

@@ -122,6 +122,11 @@ class SynapseNode(BaseModel):
     name: str = Field(..., description="Entity name")
     summary: Optional[str] = Field(None, description="Evolving summary")
 
+    # Identity hierarchy: user → agent → chat → session
+    user_id: Optional[str] = Field(None, description="User identifier")
+    agent_id: Optional[str] = Field(None, description="Agent identifier for multi-agent")
+    chat_id: Optional[str] = Field(None, description="Chat/conversation identifier")
+
     # Memory layer
     memory_layer: MemoryLayer = Field(
         MemoryLayer.SEMANTIC, description="Which memory layer"
@@ -190,15 +195,29 @@ class SynapseEpisode(BaseModel):
     recorded_at: datetime = Field(default_factory=utcnow)
     expires_at: Optional[datetime] = Field(None, description="TTL expiration")
 
-    # User context
-    user_id: Optional[str] = Field(None)
-    session_id: Optional[str] = Field(None)
+    # Identity hierarchy: user → agent → chat → session
+    user_id: Optional[str] = Field(None, description="User identifier")
+    agent_id: Optional[str] = Field(None, description="Agent identifier")
+    chat_id: Optional[str] = Field(None, description="Chat/conversation identifier")
+    session_id: Optional[str] = Field(None, description="Session identifier")
 
 
 class UserModel(BaseModel):
-    """User Model (Layer 1) - User preferences and expertise"""
+    """User Model (Layer 1) - User preferences and expertise
 
+    Identity Hierarchy:
+    - user_id: Required, identifies the human user
+    - agent_id: Optional, identifies which AI agent (for multi-agent)
+    - chat_id: Optional, identifies the conversation thread
+
+    Lookup uses composite key: user_id[:agent_id][:chat_id]
+    Fallback chain: specific → agent-level → user-level
+    """
+
+    # Identity hierarchy: user → agent → chat
     user_id: str = Field(..., description="User identifier")
+    agent_id: Optional[str] = Field(None, description="Agent identifier for multi-agent support")
+    chat_id: Optional[str] = Field(None, description="Chat/conversation identifier")
 
     # Preferences
     language: str = Field("th", description="Preferred language")
@@ -219,7 +238,17 @@ class UserModel(BaseModel):
     notes: List[str] = Field(default_factory=list, description="Free-form notes")
 
     # Timestamps
+    created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+
+    def get_composite_key(self) -> str:
+        """Get composite key for storage lookup."""
+        parts = [self.user_id]
+        if self.agent_id:
+            parts.append(self.agent_id)
+            if self.chat_id:
+                parts.append(self.chat_id)
+        return ":".join(parts)
 
 
 class ProceduralMemory(BaseModel):
