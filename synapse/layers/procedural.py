@@ -661,6 +661,34 @@ class ProceduralManager:
         except ValueError:
             return utcnow()
 
+    def get_all_procedures(self, limit: int = 1000) -> List[ProceduralMemory]:
+        """
+        Get all procedures.
+
+        Args:
+            limit: Maximum results (default: 1000)
+
+        Returns:
+            List of all ProceduralMemory
+        """
+        procedures = []
+        now = utcnow()
+
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT * FROM procedures
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,)
+            )
+
+            for row in cursor:
+                procedures.append(self._row_to_procedure(row))
+
+        return procedures
+
 
 # Singleton instance
 _manager: Optional[ProceduralManager] = None

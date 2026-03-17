@@ -969,6 +969,46 @@ class EpisodicManager:
         except ValueError:
             return None
 
+    def get_all_episodes(self, include_expired: bool = False, limit: int = 1000) -> List[SynapseEpisode]:
+        """
+        Get all episodes.
+
+        Args:
+            include_expired: Include expired episodes (default: False)
+            limit: Maximum results (default: 1000)
+
+        Returns:
+            List of all SynapseEpisode
+        """
+        now = utcnow()
+        episodes = []
+
+        with self._get_connection() as conn:
+            if include_expired:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM episodes
+                    ORDER BY recorded_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,)
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM episodes
+                    WHERE expires_at IS NULL OR expires_at > ?
+                    ORDER BY recorded_at DESC
+                    LIMIT ?
+                    """,
+                    (now.isoformat(), limit)
+                )
+
+            for row in cursor:
+                episodes.append(self._row_to_episode(row))
+
+        return episodes
+
 
 # Singleton instance
 _manager: Optional[EpisodicManager] = None

@@ -6,7 +6,7 @@ the 5-layer memory system while maintaining Graphiti compatibility.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional
 
 from synapse.layers import (
     LayerManager,
@@ -605,3 +605,398 @@ class SynapseService:
     def clear_working_context(self) -> int:
         """Clear working memory."""
         return self.layers.clear_working()
+
+    # ============================================
+    # ORACLE TOOLS (Gap 3)
+    # ============================================
+
+    async def consult(
+        self,
+        query: str,
+        layers: Optional[List[str]] = None,
+        limit: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Consult memory layers for guidance on a query.
+
+        Searches across specified layers to find relevant guidance,
+        combining results with relevance ranking.
+
+        Args:
+            query: Question or topic to consult about
+            layers: Optional list of layers to search ('user_model', 'procedural',
+                   'semantic', 'episodic', 'working'). Default: all layers
+            limit: Maximum results per layer
+
+        Returns:
+            Dict with guidance from each layer, ranked by relevance
+        """
+        from synapse.layers import MemoryLayer
+
+        # Convert string layer names to MemoryLayer enums
+        target_layers = None
+        if layers:
+            target_layers = []
+            layer_map = {
+                'user_model': MemoryLayer.USER_MODEL,
+                'procedural': MemoryLayer.PROCEDURAL,
+                'semantic': MemoryLayer.SEMANTIC,
+                'episodic': MemoryLayer.EPISODIC,
+                'working': MemoryLayer.WORKING,
+            }
+            for layer_name in layers:
+                if layer_name.lower() in layer_map:
+                    target_layers.append(layer_map[layer_name.lower()])
+
+        # Search all specified layers
+        results = await self.layers.search_all(
+            query=query,
+            layers=target_layers,
+            limit_per_layer=limit,
+            user_id=self.user_id,
+        )
+
+        # Format results for each layer
+        guidance = {
+            "query": query,
+            "identity": self.get_identity(),
+            "layers": {},
+            "summary": [],
+        }
+
+        for layer, items in results.items():
+            layer_name = layer.value if hasattr(layer, 'value') else str(layer)
+            guidance["layers"][layer_name] = items
+
+            # Add to summary if results found
+            if items:
+                guidance["summary"].append({
+                    "layer": layer_name,
+                    "count": len(items),
+                    "top_result": self._extract_top_result(items),
+                })
+
+        return guidance
+
+    def _extract_top_result(self, items: List[Any]) -> Optional[Dict[str, Any]]:
+        """Extract the most relevant result from a list of items."""
+        if not items:
+            return None
+
+        top = items[0]
+
+        # Handle different item types
+        if isinstance(top, dict):
+            return {"type": "dict", "preview": str(top)[:200]}
+        elif hasattr(top, 'to_dict'):
+            return {"type": "model", "preview": str(top.to_dict())[:200]}
+        else:
+            return {"type": "unknown", "preview": str(top)[:200]}
+
+    async def reflect(
+        self,
+        layer: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Get a random insight from memory layers.
+
+        Retrieves a random piece of knowledge from specified layer
+        (or all layers if not specified) for reflection.
+
+        Args:
+            layer: Optional specific layer to reflect from
+                  ('procedural', 'episodic', 'working')
+
+        Returns:
+            Random insight from memory
+        """
+        import random
+
+        insights = []
+        source_layer = None
+
+        if layer and layer.lower() == 'procedural':
+            # Get random procedure
+            procedures = self.layers.procedural.get_all_procedures()
+            if procedures:
+                proc = random.choice(procedures)
+                insights.append({
+                    "type": "procedure",
+                    "trigger": proc.trigger,
+                    "steps": proc.procedure,
+                    "success_count": proc.success_count,
+                })
+                source_layer = "procedural"
+
+        elif layer and layer.lower() == 'episodic':
+            # Get random episode
+            episodes = self.layers.episodic.get_all_episodes()
+            if episodes:
+                ep = random.choice(episodes)
+                insights.append({
+                    "type": "episode",
+                    "content": ep.content,
+                    "summary": ep.summary,
+                    "topics": ep.topics,
+                })
+                source_layer = "episodic"
+
+        elif layer and layer.lower() == 'working':
+            # Get random working memory item
+            all_context = self.layers.working.get_all_context()
+            if all_context:
+                key, value = random.choice(list(all_context.items()))
+                insights.append({
+                    "type": "working_context",
+                    "key": key,
+                    "value": value,
+                })
+                source_layer = "working"
+
+        else:
+            # Get from all layers
+            # Procedural
+            procedures = self.layers.procedural.get_all_procedures()
+            if procedures:
+                proc = random.choice(procedures)
+                insights.append({
+                    "type": "procedure",
+                    "trigger": proc.trigger,
+                    "steps": proc.procedure,
+                    "success_count": proc.success_count,
+                })
+
+            # Episodic
+            episodes = self.layers.episodic.get_all_episodes()
+            if episodes:
+                ep = random.choice(episodes)
+                insights.append({
+                    "type": "episode",
+                    "content": ep.content,
+                    "summary": ep.summary,
+                    "topics": ep.topics,
+                })
+
+            # Working
+            all_context = self.layers.working.get_all_context()
+            if all_context:
+                key, value = random.choice(list(all_context.items()))
+                insights.append({
+                    "type": "working_context",
+                    "key": key,
+                    "value": value,
+                })
+
+            source_layer = "all"
+
+        return {
+            "insights": insights,
+            "source_layer": source_layer or layer,
+            "identity": self.get_identity(),
+            "timestamp": self._get_timestamp(),
+        }
+
+    def _get_timestamp(self) -> str:
+        """Get current timestamp in ISO format."""
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).isoformat()
+
+    async def analyze_patterns(
+        self,
+        analysis_type: Optional[str] = None,
+        time_range_days: int = 30,
+    ) -> Dict[str, Any]:
+        """
+        Analyze patterns in memory across layers.
+
+        Examines user behavior, common topics, procedure usage,
+        and memory distribution.
+
+        Args:
+            analysis_type: Optional specific analysis type
+                          ('topics', 'procedures', 'activity', 'all')
+            time_range_days: Days to include in analysis (default: 30)
+
+        Returns:
+            Pattern analysis results
+        """
+        from collections import Counter
+        from datetime import datetime, timezone, timedelta
+
+        results = {
+            "analysis_type": analysis_type or "all",
+            "time_range_days": time_range_days,
+            "identity": self.get_identity(),
+            "patterns": {},
+        }
+
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=time_range_days)
+
+        # Analyze topics
+        if analysis_type in (None, "all", "topics"):
+            user = self.layers.get_user(self.user_id)
+            topic_counts = Counter(user.common_topics)
+            results["patterns"]["topics"] = {
+                "common_topics": dict(topic_counts.most_common(10)),
+                "total_unique": len(topic_counts),
+            }
+
+        # Analyze procedures
+        if analysis_type in (None, "all", "procedures"):
+            procedures = self.layers.procedural.get_all_procedures()
+            trigger_patterns = Counter(p.trigger for p in procedures)
+            success_rates = []
+            for p in procedures:
+                if p.success_count > 0:
+                    success_rates.append({
+                        "trigger": p.trigger,
+                        "success_count": p.success_count,
+                    })
+
+            results["patterns"]["procedures"] = {
+                "total_procedures": len(procedures),
+                "trigger_patterns": dict(trigger_patterns.most_common(10)),
+                "top_successful": sorted(
+                    success_rates,
+                    key=lambda x: x["success_count"],
+                    reverse=True
+                )[:5],
+            }
+
+        # Analyze activity
+        if analysis_type in (None, "all", "activity"):
+            episodes = self.layers.episodic.get_all_episodes()
+            recent_episodes = [
+                ep for ep in episodes
+                if ep.recorded_at and ep.recorded_at > cutoff_date
+            ]
+
+            results["patterns"]["activity"] = {
+                "total_episodes": len(episodes),
+                "recent_episodes": len(recent_episodes),
+                "topics_covered": list(set(
+                    topic for ep in recent_episodes
+                    for topic in (ep.topics or [])
+                ))[:20],
+            }
+
+        # Memory distribution
+        if analysis_type in (None, "all"):
+            working_context = self.layers.working.get_all_context()
+            results["patterns"]["memory_distribution"] = {
+                "user_model": 1,
+                "procedures": len(procedures) if 'procedures' in dir() else 0,
+                "episodes": len(episodes) if 'episodes' in dir() else 0,
+                "working_contexts": len(working_context),
+            }
+
+        return results
+
+    async def consolidate(
+        self,
+        source: str = "episodic",
+        criteria: Optional[Dict[str, Any]] = None,
+        min_access_count: int = 2,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Consolidate memory by promoting frequently accessed items.
+
+        Converts episodic memories that are frequently referenced
+        into semantic knowledge for long-term retention.
+
+        Args:
+            source: Source layer to consolidate from ('episodic')
+            criteria: Optional criteria for consolidation
+                     {'min_access': N, 'topics': [...], 'min_age_days': N}
+            min_access_count: Minimum access count for consolidation
+            dry_run: If True, only preview what would be consolidated
+
+        Returns:
+            Consolidation results with items promoted
+        """
+        from datetime import datetime, timezone, timedelta
+
+        criteria = criteria or {}
+        results = {
+            "source": source,
+            "criteria": criteria,
+            "dry_run": dry_run,
+            "promoted": [],
+            "skipped": [],
+            "errors": [],
+        }
+
+        if source != "episodic":
+            results["errors"].append(f"Consolidation from '{source}' not supported")
+            return results
+
+        # Get episodes for potential consolidation
+        episodes = self.layers.episodic.get_all_episodes()
+
+        # Filter by criteria
+        candidates = []
+        for ep in episodes:
+            # Check access count (simulated - using topic count as proxy)
+            access_count = len(ep.topics or [])
+            if access_count < min_access_count:
+                results["skipped"].append({
+                    "id": ep.id,
+                    "reason": f"access_count ({access_count}) < {min_access_count}",
+                })
+                continue
+
+            # Check topic criteria
+            if "topics" in criteria:
+                if not any(t in (ep.topics or []) for t in criteria["topics"]):
+                    results["skipped"].append({
+                        "id": ep.id,
+                        "reason": "topic_criteria_not_met",
+                    })
+                    continue
+
+            # Check age criteria
+            if "min_age_days" in criteria and ep.recorded_at:
+                age_days = (datetime.now(timezone.utc) - ep.recorded_at).days
+                if age_days < criteria["min_age_days"]:
+                    results["skipped"].append({
+                        "id": ep.id,
+                        "reason": f"age ({age_days} days) < {criteria['min_age_days']} days",
+                    })
+                    continue
+
+            candidates.append(ep)
+
+        # Promote candidates to semantic memory
+        for ep in candidates:
+            if dry_run:
+                results["promoted"].append({
+                    "id": ep.id,
+                    "preview": {
+                        "name": f"Consolidated: {ep.summary or ep.content[:50]}",
+                        "summary": ep.summary or ep.content[:200],
+                        "topics": ep.topics,
+                    },
+                    "status": "would_promote",
+                })
+            else:
+                try:
+                    # Create semantic entity from episode
+                    entity = await self.layers.add_entity(
+                        name=f"Consolidated: {ep.summary or ep.content[:50]}",
+                        entity_type=EntityType.CONCEPT,
+                        summary=ep.summary or ep.content[:200],
+                    )
+
+                    results["promoted"].append({
+                        "id": ep.id,
+                        "new_entity_id": entity.id,
+                        "status": "promoted",
+                    })
+                except Exception as e:
+                    results["errors"].append({
+                        "id": ep.id,
+                        "error": str(e),
+                    })
+
+        return results

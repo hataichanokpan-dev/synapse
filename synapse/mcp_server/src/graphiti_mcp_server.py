@@ -1235,6 +1235,235 @@ async def clear_identity() -> dict[str, Any] | ErrorResponse:
         return ErrorResponse(error=f'Error clearing identity: {error_msg}')
 
 
+# ============================================
+# ORACLE TOOLS (Gap 3)
+# ============================================
+
+@mcp.tool()
+async def synapse_consult(
+    query: str,
+    layers: list[str] | None = None,
+    limit: int = 5,
+) -> dict[str, Any] | ErrorResponse:
+    """Consult memory layers for guidance on a query.
+
+    Searches across specified memory layers to find relevant guidance,
+    combining results with relevance ranking. This is useful for getting
+    contextual advice based on past experiences, learned procedures,
+    and user preferences.
+
+    Args:
+        query: Question or topic to consult about
+        layers: Optional list of layers to search. Options:
+               - 'user_model': User preferences and expertise
+               - 'procedural': Learned procedures and workflows
+               - 'semantic': Concepts and facts
+               - 'episodic': Past experiences
+               - 'working': Current session context
+               Default: all layers
+        limit: Maximum results per layer (default: 5)
+
+    Returns:
+        Guidance from each layer, ranked by relevance
+
+    Example:
+        # Get guidance on coding practices
+        result = await synapse_consult(
+            query="best practices for error handling",
+            layers=["procedural", "episodic"],
+            limit=3
+        )
+
+        # Search all layers
+        result = await synapse_consult(query="user preferences for testing")
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        result = await synapse_service.consult(
+            query=query,
+            layers=layers,
+            limit=limit,
+        )
+
+        return {
+            "message": f"Consultation complete for: {query}",
+            **result,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error in synapse_consult: {error_msg}')
+        return ErrorResponse(error=f'Error in synapse_consult: {error_msg}')
+
+
+@mcp.tool()
+async def synapse_reflect(
+    layer: str | None = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Get a random insight from memory layers.
+
+    Retrieves a random piece of knowledge from memory for reflection.
+    This is useful for discovering patterns, reviewing learned behaviors,
+    or getting random inspiration from past experiences.
+
+    Args:
+        layer: Optional specific layer to reflect from. Options:
+               - 'procedural': Learned procedures
+               - 'episodic': Past experiences
+               - 'working': Current session context
+               Default: all layers
+
+    Returns:
+        Random insight(s) from the specified layer(s)
+
+    Example:
+        # Get random insight from any layer
+        result = await synapse_reflect()
+
+        # Get random procedure
+        result = await synapse_reflect(layer="procedural")
+
+        # Get random episode
+        result = await synapse_reflect(layer="episodic")
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        result = await synapse_service.reflect(layer=layer)
+
+        return {
+            "message": "Reflection insight retrieved",
+            **result,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error in synapse_reflect: {error_msg}')
+        return ErrorResponse(error=f'Error in synapse_reflect: {error_msg}')
+
+
+@mcp.tool()
+async def synapse_analyze(
+    analysis_type: str | None = None,
+    time_range_days: int = 30,
+) -> dict[str, Any] | ErrorResponse:
+    """Analyze patterns in memory across layers.
+
+    Examines user behavior, common topics, procedure usage,
+    and memory distribution to provide insights about
+    memory patterns and usage.
+
+    Args:
+        analysis_type: Optional specific analysis type. Options:
+                      - 'topics': Analyze topic patterns
+                      - 'procedures': Analyze procedure usage
+                      - 'activity': Analyze recent activity
+                      - 'all': Full analysis (default)
+        time_range_days: Days to include in analysis (default: 30)
+
+    Returns:
+        Pattern analysis results
+
+    Example:
+        # Full analysis
+        result = await synapse_analyze()
+
+        # Analyze only topics
+        result = await synapse_analyze(analysis_type="topics")
+
+        # Analyze last 7 days
+        result = await synapse_analyze(time_range_days=7)
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        result = await synapse_service.analyze_patterns(
+            analysis_type=analysis_type,
+            time_range_days=time_range_days,
+        )
+
+        return {
+            "message": f"Pattern analysis complete ({analysis_type or 'all'})",
+            **result,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error in synapse_analyze: {error_msg}')
+        return ErrorResponse(error=f'Error in synapse_analyze: {error_msg}')
+
+
+@mcp.tool()
+async def synapse_consolidate(
+    source: str = "episodic",
+    min_access_count: int = 2,
+    topics: list[str] | None = None,
+    min_age_days: int | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any] | ErrorResponse:
+    """Consolidate memory by promoting frequently accessed items.
+
+    Converts episodic memories that are frequently referenced
+    into semantic knowledge for long-term retention. This is
+    useful for "learning" from repeated experiences.
+
+    Args:
+        source: Source layer to consolidate from (default: 'episodic')
+        min_access_count: Minimum access count for consolidation (default: 2)
+        topics: Optional list of topics to filter by
+        min_age_days: Optional minimum age in days for consolidation
+        dry_run: If True, only preview what would be consolidated (default: False)
+
+    Returns:
+        Consolidation results with items promoted or previewed
+
+    Example:
+        # Preview consolidation
+        result = await synapse_consolidate(dry_run=True)
+
+        # Consolidate episodes with at least 3 topic references
+        result = await synapse_consolidate(min_access_count=3)
+
+        # Consolidate only coding-related episodes
+        result = await synapse_consolidate(topics=["coding", "programming"])
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        criteria = {}
+        if topics:
+            criteria["topics"] = topics
+        if min_age_days is not None:
+            criteria["min_age_days"] = min_age_days
+
+        result = await synapse_service.consolidate(
+            source=source,
+            criteria=criteria if criteria else None,
+            min_access_count=min_access_count,
+            dry_run=dry_run,
+        )
+
+        action = "previewed" if dry_run else "consolidated"
+        return {
+            "message": f"Memory {action}: {len(result['promoted'])} items",
+            **result,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error in synapse_consolidate: {error_msg}')
+        return ErrorResponse(error=f'Error in synapse_consolidate: {error_msg}')
+
+
 @mcp.tool()
 async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
     """Delete an entity edge from the graph memory.
