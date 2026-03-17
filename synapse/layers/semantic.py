@@ -16,10 +16,16 @@ This layer wraps Graphiti's functionality with:
 """
 
 import logging
+import os
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 from synapse.storage import QdrantClient
+from synapse.graphiti.errors import (
+    GraphitiWriteError,
+    GraphitiConnectionError,
+    GraphitiNotInitializedError,
+)
 
 from .types import (
     SynapseNode,
@@ -34,6 +40,10 @@ from .decay import compute_decay_score, should_forget
 
 logger = logging.getLogger(__name__)
 DEFAULT_COLLECTION_NAME = "semantic_memory"
+
+# Environment variable to require Graphiti in production
+# When true, Graphiti write failures will raise exceptions instead of silent warnings
+_REQUIRE_GRAPHITI = os.environ.get("SYNAPSE_REQUIRE_GRAPHITI", "false").lower() == "true"
 
 # Lazy import for Thai NLP
 _nlp_preprocessor = None
@@ -86,11 +96,56 @@ class SemanticManager:
                 self._initialized = True
             except Exception as exc:
                 if require:
-                    raise RuntimeError(
-                        "Graphiti not available. Install graphiti-core or provide client."
+                    raise GraphitiNotInitializedError(
+                        "SemanticManager operations"
                     ) from exc
                 return False
         return True
+
+    async def verify_graphiti_connection(self) -> bool:
+        """
+        Verify Graphiti is connected and writable.
+
+        This health check attempts a simple operation to confirm
+        the graph database is accessible.
+
+        Returns:
+            True if Graphiti is available and working, False otherwise.
+        """
+        if self._graphiti is None:
+            return False
+        try:
+            # Try a simple search to verify connection
+            await self._graphiti.search(query="__health_check__", num_results=1)
+            return True
+        except Exception as e:
+            logger.warning(f"Graphiti connection check failed: {e}")
+            return False
+
+    def _handle_graphiti_error(self, operation: str, error: Exception, entity_name: str | None = None) -> None:
+        """
+        Handle Graphiti write errors consistently.
+
+        If SYNAPSE_REQUIRE_GRAPHITI=true, raises GraphitiWriteError.
+        Otherwise, logs a warning (backward compatible behavior).
+
+        Args:
+            operation: Name of the operation (e.g., 'add_entity', 'add_fact')
+            error: The exception that occurred
+            entity_name: Optional entity name for context
+
+        Raises:
+            GraphitiWriteError: If SYNAPSE_REQUIRE_GRAPHITI=true
+        """
+        if _REQUIRE_GRAPHITI:
+            raise GraphitiWriteError(
+                operation=operation,
+                reason=str(error),
+                entity_name=entity_name,
+            ) from error
+        else:
+            # Backward compatible: silent warning
+            logger.warning(f"Graphiti write failed during '{operation}' for '{entity_name}': {error}")
 
     def _warn_vector_issue(self, exc: Exception) -> None:
         """Log a single warning when Qdrant is unavailable."""
@@ -241,7 +296,9 @@ class SemanticManager:
                 )
                 logger.debug(f"Entity '{processed_name}' persisted to Graphiti")
             except Exception as e:
-                logger.warning(f"Failed to persist entity to Graphiti: {e}")
+                self._handle_graphiti_error("add_entity", e, processed_name)
+        elif _REQUIRE_GRAPHITI:
+            raise GraphitiNotInitializedError("add_entity")
 
         return node
 
@@ -301,7 +358,9 @@ class SemanticManager:
                 )
                 logger.debug(f"Fact '{edge_id}' persisted to Graphiti")
             except Exception as e:
-                logger.warning(f"Failed to persist fact to Graphiti: {e}")
+                self._handle_graphiti_error("add_fact", e, edge_id)
+        elif _REQUIRE_GRAPHITI:
+            raise GraphitiNotInitializedError("add_fact")
 
         return edge
 
@@ -468,7 +527,9 @@ class SemanticManager:
                 )
                 logger.debug(f"Fact '{old_edge_id}' marked as invalid in Graphiti")
             except Exception as e:
-                logger.warning(f"Failed to mark old fact as invalid: {e}")
+                self._handle_graphiti_error("supersede_fact_invalidation", e, old_edge_id)
+        elif _REQUIRE_GRAPHITI:
+            raise GraphitiNotInitializedError("supersede_fact")
 
         # Create new edge
         new_edge.valid_at = now
@@ -485,7 +546,7 @@ class SemanticManager:
                 )
                 logger.debug(f"New fact '{new_edge.id}' persisted to Graphiti")
             except Exception as e:
-                logger.warning(f"Failed to persist new fact to Graphiti: {e}")
+                self._handle_graphiti_error("supersede_fact_new", e, new_edge.id)
 
         return new_edge
 
@@ -540,7 +601,9 @@ class SemanticManager:
                 )
                 logger.debug(f"Entity '{entity_id}' update persisted to Graphiti")
             except Exception as e:
-                logger.warning(f"Failed to persist entity update to Graphiti: {e}")
+                self._handle_graphiti_error("update_entity", e, entity_id)
+        elif _REQUIRE_GRAPHITI:
+            raise GraphitiNotInitializedError("update_entity")
 
         return node
 

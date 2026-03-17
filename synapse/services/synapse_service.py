@@ -6,6 +6,7 @@ the 5-layer memory system while maintaining Graphiti compatibility.
 """
 
 import logging
+from datetime import datetime as dt
 from typing import Any, Dict, List, Optional
 
 from synapse.layers import (
@@ -184,6 +185,7 @@ class SynapseService:
         try:
             # Import EpisodeType for source conversion
             from graphiti_core.nodes import EpisodeType
+            from datetime import datetime as dt
 
             episode_type = EpisodeType.text  # Default
             if source:
@@ -192,6 +194,15 @@ class SynapseService:
                 except (KeyError, AttributeError):
                     logger.warning(f"Unknown source type '{source}', using 'text' as default")
                     episode_type = EpisodeType.text
+
+            # Graphiti requires a valid reference_time, default to now if not provided
+            if reference_time is None:
+                reference_time = dt.now()
+
+            # Graphiti requires a valid group_id (alphanumeric, dashes, underscores only)
+            # Default to 'default' if not provided
+            if group_id is None:
+                group_id = "default"
 
             graphiti_result = await self.graphiti.add_episode(
                 name=name,

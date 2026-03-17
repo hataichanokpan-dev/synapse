@@ -12,6 +12,19 @@ This vendored copy is kept for future customization and integration with
 Synapse's Five-Layer Memory Model.
 """
 
-from .graphiti import Graphiti
+# Lazy import to avoid requiring graphiti_core for basic operations
+# Only import when actually needed
+Graphiti = None
 
-__all__ = ['Graphiti']
+def get_graphiti():
+    """Get Graphiti class (lazy import)."""
+    global Graphiti
+    if Graphiti is None:
+        try:
+            from .graphiti import Graphiti as _Graphiti
+            Graphiti = _Graphiti
+        except ImportError:
+            pass
+    return Graphiti
+
+__all__ = ['Graphiti', 'get_graphiti']

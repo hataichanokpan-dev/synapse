@@ -82,3 +82,7 @@ models/
 **/secrets.json
 **/*.pem
 **/*.key
+
+# Node.js
+node_modules/
+.next/
