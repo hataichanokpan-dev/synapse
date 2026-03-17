@@ -6,7 +6,7 @@ the 5-layer memory system while maintaining Graphiti compatibility.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from synapse.layers import (
     LayerManager,
@@ -345,6 +345,123 @@ class SynapseService:
             "notes": user.notes,
             "updated_at": user.updated_at.isoformat() if user.updated_at else None,
         }
+
+    def update_user_preferences(
+        self,
+        language: Optional[str] = None,
+        response_style: Optional[str] = None,
+        response_length: Optional[str] = None,
+        timezone: Optional[str] = None,
+        add_expertise: Optional[Dict[str, str]] = None,
+        add_topic: Optional[str] = None,
+        add_note: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Update user preferences in user model layer.
+
+        Args:
+            language: Preferred language ('th', 'en', etc.)
+            response_style: 'formal' | 'casual' | 'auto'
+            response_length: 'concise' | 'detailed' | 'auto'
+            timezone: User timezone (e.g., 'Asia/Bangkok')
+            add_expertise: Dict of {topic: level} to add
+            add_topic: Common topic to add
+            add_note: Free-form note to add
+            user_id: User identifier (uses default if not provided)
+
+        Returns:
+            Updated user context
+        """
+        uid = user_id or self.user_id
+
+        # Build kwargs for update
+        kwargs: Dict[str, Any] = {}
+        if language:
+            kwargs['language'] = language
+        if response_style:
+            kwargs['response_style'] = response_style
+        if response_length:
+            kwargs['response_length'] = response_length
+        if timezone:
+            kwargs['timezone'] = timezone
+        if add_topic:
+            kwargs['add_topic'] = add_topic
+        if add_note:
+            kwargs['add_note'] = add_note
+
+        # Handle expertise separately (need to merge with existing)
+        if add_expertise:
+            user = self.layers.get_user(uid)
+            merged_expertise = {**user.expertise, **add_expertise}
+            kwargs['expertise'] = merged_expertise
+
+        # Perform update
+        self.layers.update_user(uid, **kwargs)
+
+        # Return updated context
+        return self.get_user_context()
+
+    def add_procedure(
+        self,
+        trigger: str,
+        steps: List[str],
+        topics: Optional[List[str]] = None,
+        source: str = "explicit",
+    ) -> Dict[str, Any]:
+        """
+        Add a new procedure to procedural memory.
+
+        Args:
+            trigger: When to activate this procedure
+            steps: List of steps to execute
+            topics: Related topics for categorization
+            source: 'explicit' | 'correction' | 'repeated_pattern'
+
+        Returns:
+            Created procedure info
+        """
+        procedure = self.layers.learn_procedure(
+            trigger=trigger,
+            steps=steps,
+            source=source,
+            topics=topics or [],
+        )
+
+        return {
+            "id": procedure.id,
+            "trigger": procedure.trigger,
+            "steps": procedure.procedure,
+            "topics": procedure.topics,
+            "source": procedure.source,
+            "success_count": procedure.success_count,
+        }
+
+    def record_procedure_success(self, procedure_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Record successful use of a procedure.
+
+        Args:
+            procedure_id: ID of the procedure that succeeded
+
+        Returns:
+            Updated procedure info or None if not found
+        """
+        procedure = self.layers.record_procedure_success(procedure_id)
+
+        if procedure is None:
+            return None
+
+        return {
+            "id": procedure.id,
+            "trigger": procedure.trigger,
+            "success_count": procedure.success_count,
+            "last_used": procedure.last_used.isoformat() if procedure.last_used else None,
+        }
+
+    def get_all_working_context(self) -> Dict[str, Any]:
+        """Get all working memory context."""
+        return self.layers.working.get_all_context()
 
     # ============================================
     # HEALTH CHECK

@@ -671,6 +671,430 @@ async def search_memory_layers(
         return ErrorResponse(error=f'Error searching memory layers: {error_msg}')
 
 
+# ============================================
+# LAYER 1: USER MODEL TOOLS
+# ============================================
+
+@mcp.tool()
+async def get_user_preferences(
+    user_id: str | None = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Get user preferences and expertise from user model layer (Layer 1).
+
+    Returns user language preference, response style, expertise areas,
+    common topics, and personal notes.
+
+    Args:
+        user_id: User identifier (uses default if not provided)
+
+    Returns:
+        User model with all preferences including:
+        - user_id: Unique identifier
+        - language: Preferred language (e.g., 'th', 'en')
+        - response_style: 'formal' | 'casual' | 'auto'
+        - response_length: 'concise' | 'detailed' | 'auto'
+        - timezone: User timezone
+        - expertise: Dict of {topic: level}
+        - common_topics: List of frequently discussed topics
+        - notes: List of personal notes
+
+    Example:
+        result = await get_user_preferences()
+        print(result['language'])  # 'th'
+        print(result['expertise'])  # {'python': 'expert', 'javascript': 'intermediate'}
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        # Temporarily switch user context if provided
+        original_user_id = synapse_service.user_id
+        if user_id:
+            synapse_service.user_id = user_id
+
+        result = synapse_service.get_user_context()
+
+        # Restore original user_id
+        if user_id:
+            synapse_service.user_id = original_user_id
+
+        return {
+            "message": "User preferences retrieved successfully",
+            "user": result,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error getting user preferences: {error_msg}')
+        return ErrorResponse(error=f'Error getting user preferences: {error_msg}')
+
+
+@mcp.tool()
+async def update_user_preferences(
+    language: str | None = None,
+    response_style: str | None = None,
+    response_length: str | None = None,
+    timezone: str | None = None,
+    add_expertise: dict[str, str] | None = None,
+    add_topic: str | None = None,
+    add_note: str | None = None,
+    user_id: str | None = None,
+) -> SuccessResponse | ErrorResponse:
+    """Update user preferences in user model layer (Layer 1).
+
+    Updates user preferences that persist across sessions. These preferences
+    inform how the AI should respond to this user.
+
+    Args:
+        language: Preferred language ('th', 'en', etc.)
+        response_style: 'formal' | 'casual' | 'auto'
+        response_length: 'concise' | 'detailed' | 'auto'
+        timezone: User timezone (e.g., 'Asia/Bangkok')
+        add_expertise: Dict of {topic: level} to add (e.g., {'python': 'expert'})
+        add_topic: Common topic to add to frequently discussed list
+        add_note: Free-form note about the user
+        user_id: User identifier (uses default if not provided)
+
+    Returns:
+        Success confirmation with updated preferences
+
+    Example:
+        # Update language and add expertise
+        await update_user_preferences(
+            language='th',
+            add_expertise={'python': 'expert', 'docker': 'intermediate'}
+        )
+
+        # Add a common topic
+        await update_user_preferences(add_topic='machine learning')
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        result = synapse_service.update_user_preferences(
+            language=language,
+            response_style=response_style,
+            response_length=response_length,
+            timezone=timezone,
+            add_expertise=add_expertise,
+            add_topic=add_topic,
+            add_note=add_note,
+            user_id=user_id,
+        )
+
+        return SuccessResponse(
+            message=f"User preferences updated successfully for user '{result.get('user_id', 'default')}'"
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error updating user preferences: {error_msg}')
+        return ErrorResponse(error=f'Error updating user preferences: {error_msg}')
+
+
+# ============================================
+# LAYER 2: PROCEDURAL MEMORY TOOLS
+# ============================================
+
+@mcp.tool()
+async def find_procedures(
+    trigger: str,
+    limit: int = 5,
+) -> dict[str, Any] | ErrorResponse:
+    """Find procedures matching a trigger from procedural memory (Layer 2).
+
+    Searches procedural memory for procedures that match the given
+    trigger keyword or phrase. Procedures are how-to patterns that
+    have been learned from user interactions.
+
+    Args:
+        trigger: Search keyword/phrase to match (e.g., 'deploy', 'git commit')
+        limit: Maximum number of results (default: 5)
+
+    Returns:
+        List of matching procedures, each containing:
+        - id: Unique procedure identifier
+        - trigger: When to activate this procedure
+        - steps: List of steps to execute
+        - source: How this procedure was learned
+        - success_count: Number of successful uses
+        - last_used: When it was last used
+
+    Example:
+        result = await find_procedures('deploy')
+        for proc in result['procedures']:
+            print(f"{proc['trigger']}: {len(proc['steps'])} steps")
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        procedures = synapse_service.find_procedure(trigger, limit)
+
+        return {
+            "message": f"Found {len(procedures)} procedures matching '{trigger}'",
+            "trigger": trigger,
+            "procedures": procedures,
+            "count": len(procedures),
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error finding procedures: {error_msg}')
+        return ErrorResponse(error=f'Error finding procedures: {error_msg}')
+
+
+@mcp.tool()
+async def add_procedure(
+    trigger: str,
+    steps: list[str],
+    topics: list[str] | None = None,
+    source: str = "explicit",
+) -> SuccessResponse | ErrorResponse:
+    """Add a new procedure to procedural memory (Layer 2).
+
+    Creates a new procedure that can be activated when the trigger
+    matches user input. Procedures represent learned how-to patterns.
+
+    Args:
+        trigger: When to activate this procedure (e.g., 'deploy to production')
+        steps: List of steps to execute in order
+        topics: Related topics for categorization (optional)
+        source: How this procedure was learned:
+            - 'explicit': Directly taught by user
+            - 'correction': Learned from user correction
+            - 'repeated_pattern': Detected from repeated behavior
+
+    Returns:
+        Success confirmation with procedure details
+
+    Example:
+        await add_procedure(
+            trigger='deploy to production',
+            steps=[
+                'Run all tests',
+                'Build Docker image',
+                'Push to registry',
+                'Update Kubernetes deployment'
+            ],
+            topics=['deployment', 'kubernetes', 'docker'],
+            source='explicit'
+        )
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        procedure = synapse_service.add_procedure(
+            trigger=trigger,
+            steps=steps,
+            topics=topics,
+            source=source,
+        )
+
+        return SuccessResponse(
+            message=f"Procedure '{trigger}' added with {len(steps)} steps (id: {procedure['id']})"
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error adding procedure: {error_msg}')
+        return ErrorResponse(error=f'Error adding procedure: {error_msg}')
+
+
+@mcp.tool()
+async def record_procedure_success(
+    procedure_id: str,
+) -> SuccessResponse | ErrorResponse:
+    """Record successful use of a procedure (Layer 2).
+
+    Increments the success count and updates the last_used timestamp.
+    This helps the system learn which procedures are most reliable.
+
+    Args:
+        procedure_id: ID of the procedure that succeeded
+
+    Returns:
+        Success confirmation with updated count
+
+    Example:
+        # After successfully executing a procedure
+        await record_procedure_success(proc_id)
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        result = synapse_service.record_procedure_success(procedure_id)
+
+        if result is None:
+            return ErrorResponse(error=f'Procedure with id {procedure_id} not found')
+
+        return SuccessResponse(
+            message=f"Procedure '{procedure_id}' success recorded (count: {result['success_count']})"
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error recording procedure success: {error_msg}')
+        return ErrorResponse(error=f'Error recording procedure success: {error_msg}')
+
+
+# ============================================
+# LAYER 5: WORKING MEMORY TOOLS
+# ============================================
+
+@mcp.tool()
+async def get_working_context(
+    key: str | None = None,
+    default: Any = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Get working memory context from working memory layer (Layer 5).
+
+    Working memory holds temporary session data that persists during
+    the current session but doesn't need long-term storage.
+
+    Args:
+        key: Specific key to retrieve (returns all context if not provided)
+        default: Default value if key not found (only used when key is provided)
+
+    Returns:
+        If key provided: The value for that key (or default)
+        If no key: All context as a dict with count
+
+    Example:
+        # Get specific value
+        result = await get_working_context('current_task')
+        print(result['value'])  # 'fixing bug #123'
+
+        # Get all context
+        result = await get_working_context()
+        print(result['context'])  # {'current_task': 'fixing bug', 'session_start': '...'}
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        if key:
+            value = synapse_service.get_working_context(key, default)
+            return {
+                "message": "Working context value retrieved",
+                "key": key,
+                "value": value,
+                "found": value is not None or default is not None,
+            }
+        else:
+            # Return all context
+            all_context = synapse_service.get_all_working_context()
+            return {
+                "message": "All working context retrieved",
+                "context": all_context,
+                "count": len(all_context),
+            }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error getting working context: {error_msg}')
+        return ErrorResponse(error=f'Error getting working context: {error_msg}')
+
+
+@mcp.tool()
+async def set_working_context(
+    key: str,
+    value: Any,
+) -> SuccessResponse | ErrorResponse:
+    """Set working memory context in working memory layer (Layer 5).
+
+    Stores a value in working memory for the current session. This is
+    useful for maintaining state across interactions without persisting
+    to long-term memory.
+
+    Args:
+        key: Context key (e.g., 'current_task', 'active_file')
+        value: Context value (any JSON-serializable value)
+
+    Returns:
+        Success confirmation
+
+    Example:
+        await set_working_context('current_task', 'implementing feature X')
+        await set_working_context('active_files', ['main.py', 'utils.py'])
+        await set_working_context('session_metadata', {'started': '2024-01-15', 'user': 'john'})
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        synapse_service.set_working_context(key, value)
+
+        return SuccessResponse(
+            message=f"Working context '{key}' set successfully"
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error setting working context: {error_msg}')
+        return ErrorResponse(error=f'Error setting working context: {error_msg}')
+
+
+@mcp.tool()
+async def clear_working_context(
+    key: str | None = None,
+) -> SuccessResponse | ErrorResponse:
+    """Clear working memory context (Layer 5).
+
+    Removes context from working memory. Can clear a specific key
+    or all context at once.
+
+    Args:
+        key: Specific key to clear (clears all if not provided)
+
+    Returns:
+        Number of items cleared
+
+    Example:
+        # Clear specific key
+        await clear_working_context('current_task')
+
+        # Clear all working memory
+        await clear_working_context()
+    """
+    global synapse_service
+
+    if synapse_service is None:
+        return ErrorResponse(error='SynapseService not initialized')
+
+    try:
+        if key:
+            # Clear specific key - check if it exists first
+            existing = synapse_service.get_working_context(key)
+            if existing is None:
+                return SuccessResponse(message=f"Key '{key}' not found in working context")
+
+            # Set to None to remove
+            synapse_service.layers.working.clear_key(key)
+            count = 1
+        else:
+            # Clear all
+            count = synapse_service.clear_working_context()
+
+        return SuccessResponse(
+            message=f"Cleared {count} working context item(s)"
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error clearing working context: {error_msg}')
+        return ErrorResponse(error=f'Error clearing working context: {error_msg}')
+
+
 @mcp.tool()
 async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
     """Delete an entity edge from the graph memory.

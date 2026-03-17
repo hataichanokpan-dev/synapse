@@ -161,6 +161,18 @@ class WorkingManager:
                 return True
             return False
 
+    def clear_key(self, key: str) -> bool:
+        """
+        Alias for delete_context for API consistency.
+
+        Args:
+            key: Context key
+
+        Returns:
+            True if cleared, False if not found
+        """
+        return self.delete_context(key)
+
     def clear_context(self) -> int:
         """
         Clear all context values.
