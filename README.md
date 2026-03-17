@@ -332,7 +332,22 @@ class CustomLayer:
 |-----------|--------|-------------|
 | M1 Smoke Test | ✅ Complete | Basic functionality verified |
 | M2 MCP Integration | ✅ Complete | Anthropic LLM + Local Embedder + BGE Reranker |
-| M3 Production Deploy | ⏳ Pending | Docker Compose + Production Config |
+| M3 Production Deploy | ✅ Complete | Docker Compose + Production Config |
+| M4 Bug Fixes | ✅ Complete | RediSearch group_id fix with auto-patch |
+
+### Known Issues & Fixes
+
+#### RediSearch Syntax Error with group_id
+
+**Problem:** group_ids containing reserved words (like `user`) or hyphens caused RediSearch syntax errors.
+
+**Solution:** Added `docker/patch_graphiti_core.sh` that automatically patches the graphiti_core library during Docker build using `re.escape()` for group_ids.
+
+```bash
+# The patch is applied automatically during docker build
+# Manual verification:
+docker exec synapse-server grep "re.escape(gid)" /opt/venv/lib/python3.12/site-packages/graphiti_core/driver/falkordb_driver.py
+```
 
 ---
 

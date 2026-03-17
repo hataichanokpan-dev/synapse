@@ -25,6 +25,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir -e .
 
+# Copy and apply patch for graphiti_core RediSearch bug
+COPY docker/patch_graphiti_core.sh /tmp/patch_graphiti_core.sh
+RUN chmod +x /tmp/patch_graphiti_core.sh && \
+    /tmp/patch_graphiti_core.sh && \
+    rm /tmp/patch_graphiti_core.sh
+
 # Stage 2: Runtime
 FROM python:3.12-slim AS runtime
 

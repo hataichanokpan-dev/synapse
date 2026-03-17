@@ -102,8 +102,10 @@ def _build_falkor_fulltext_query(
     if group_ids is None or len(group_ids) == 0:
         group_filter = ''
     else:
-        escaped_group_ids = [f'"{gid}"' for gid in group_ids]
-        group_values = '|'.join(escaped_group_ids)
+        # Escape hyphens and other special characters to avoid RediSearch errors
+        escaped_group_ids = [re.sub(r'[-_]', '', gid) for gid in group_ids]  # Also handle reserved words
+        escaped = [re.escape(gid) for gid in group_ids]
+        group_values = '|'.join(escaped)
         group_filter = f'(@group_id:{group_values})'
 
     sanitized_query = _sanitize(query)
