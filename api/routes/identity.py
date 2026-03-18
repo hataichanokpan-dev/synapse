@@ -19,6 +19,7 @@ from api.models import (
     UserPreferences,
     UpdatePreferencesRequest,
     PreferencesResponse,
+    ResponseStyle,
 )
 
 router = APIRouter(tags=["Identity"])
@@ -27,7 +28,7 @@ router = APIRouter(tags=["Identity"])
 @router.get("/", response_model=IdentityResponse)
 async def get_identity(service=Depends(get_synapse_service)):
     """Get current identity context."""
-    result = await service.get_identity()
+    result = service.get_identity()
     return IdentityResponse(
         user_id=result.get("user_id"),
         agent_id=result.get("agent_id"),
@@ -41,7 +42,7 @@ async def set_identity(
     service=Depends(get_synapse_service),
 ):
     """Set identity context."""
-    result = await service.set_identity(
+    result = service.set_identity(
         user_id=request.user_id,
         agent_id=request.agent_id,
         chat_id=request.chat_id,
@@ -56,10 +57,10 @@ async def set_identity(
 @router.delete("/", response_model=SuccessResponse)
 async def clear_identity(service=Depends(get_synapse_service)):
     """Clear identity context."""
-    result = await service.clear_identity()
+    result = service.clear_identity()
     return SuccessResponse(
         message="Identity cleared",
-        detail=f"Previous: {result.get('previous', {})}",
+        detail=f"Previous: {result}",
     )
 
 
@@ -69,19 +70,34 @@ async def get_preferences(
     service=Depends(get_synapse_service),
 ):
     """Get user preferences (Layer 1 - User Model)."""
-    result = await service.get_user_preferences(user_id=user_id)
+    result = service.get_user_context()
+
+    # Normalize types: service may return dict for expertise, list for notes
+    expertise_raw = result.get("expertise", [])
+    expertise = list(expertise_raw.keys()) if isinstance(expertise_raw, dict) else list(expertise_raw)
+    notes_raw = result.get("notes", "")
+    notes = ", ".join(notes_raw) if isinstance(notes_raw, list) else str(notes_raw)
+
+    # Normalize response_style: service may return values not in ResponseStyle enum
+    style = result.get("response_style", "balanced")
+    try:
+        style = ResponseStyle(style)
+    except ValueError:
+        style = ResponseStyle.BALANCED
+
     prefs = UserPreferences(
         language=result.get("language", "en"),
         timezone=result.get("timezone", "UTC"),
-        response_style=result.get("response_style", "balanced"),
-        expertise=result.get("expertise", []),
-        topics=result.get("topics", []),
-        notes=result.get("notes", ""),
-        custom=result.get("custom", {}),
+        response_style=style,
+        expertise=expertise,
+        topics=result.get("common_topics", []),
+        notes=notes,
+        custom={},
     )
     return PreferencesResponse(
-        user_id=user_id,
+        user_id=result.get("user_id", user_id),
         preferences=prefs,
+        updated_at=result.get("updated_at"),
     )
 
 
@@ -93,21 +109,38 @@ async def update_preferences(
     """Update user preferences."""
     updates = request.model_dump(exclude_unset=True, exclude_none=True)
 
-    # Handle list operations
-    updates.pop("add_expertise", None)
-    updates.pop("remove_expertise", None)
-    updates.pop("add_topics", None)
-    updates.pop("remove_topics", None)
+    # Map frontend field names to service params
+    kwargs = {}
+    if "language" in updates:
+        kwargs["language"] = updates["language"]
+    if "timezone" in updates:
+        kwargs["timezone"] = updates["timezone"]
+    if "response_style" in updates:
+        kwargs["response_style"] = updates["response_style"]
+    if "add_expertise" in updates and updates["add_expertise"]:
+        kwargs["add_expertise"] = updates["add_expertise"]
+    if "add_topics" in updates and updates["add_topics"]:
+        kwargs["add_topic"] = updates["add_topics"]
 
-    result = await service.update_user_preferences(**updates)
+    result = service.update_user_preferences(**kwargs)
+
+    expertise_raw = result.get("expertise", [])
+    expertise = list(expertise_raw.keys()) if isinstance(expertise_raw, dict) else list(expertise_raw)
+    notes_raw = result.get("notes", "")
+    notes = ", ".join(notes_raw) if isinstance(notes_raw, list) else str(notes_raw)
+    style = result.get("response_style", "balanced")
+    try:
+        style = ResponseStyle(style)
+    except ValueError:
+        style = ResponseStyle.BALANCED
 
     prefs = UserPreferences(
         language=result.get("language", "en"),
         timezone=result.get("timezone", "UTC"),
-        response_style=result.get("response_style", "balanced"),
-        expertise=result.get("expertise", []),
-        topics=result.get("topics", []),
-        notes=result.get("notes", ""),
-        custom=result.get("custom", {}),
+        response_style=style,
+        expertise=expertise,
+        topics=result.get("common_topics", []),
+        notes=notes,
+        custom={},
     )
     return PreferencesResponse(preferences=prefs)

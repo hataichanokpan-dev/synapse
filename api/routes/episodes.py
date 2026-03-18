@@ -29,23 +29,32 @@ async def list_episodes(
     order: str = Query("desc", regex="^(asc|desc)$"),
     service=Depends(get_synapse_service),
 ):
-    """List episodes."""
-    # Use existing MCP method for Graphiti episodes
-    result = await service.get_episodes(group_id=group_id, limit=limit, offset=offset)
+    """List episodes from both local storage and knowledge graph."""
+    result = await service.get_episodes(
+        group_id=group_id,
+        limit=limit,
+        offset=offset,
+        sort=sort,
+        order=order,
+    )
 
     episodes = result.get("episodes", [])
 
     return EpisodeListResponse(
         episodes=[
             EpisodeResponse(
-                uuid=e.get("uuid", str(i)),
+                uuid=e.get("uuid", ""),
                 name=e.get("name", ""),
                 content=e.get("content", ""),
                 source=e.get("source", "unknown"),
+                source_id=e.get("source_id"),
+                source_description=e.get("source_description"),
                 group_id=e.get("group_id", group_id),
                 created_at=e.get("created_at"),
+                entity_count=e.get("entity_count"),
+                edge_count=e.get("edge_count"),
             )
-            for i, e in enumerate(episodes)
+            for e in episodes
         ],
         total=result.get("total", len(episodes)),
         limit=limit,
@@ -59,7 +68,6 @@ async def get_episode(
     service=Depends(get_synapse_service),
 ):
     """Get episode details by ID."""
-    # GAP - needs direct DB access
     result = await service.get_episode_by_id(episode_id=episode_id)
 
     if not result:
@@ -70,12 +78,15 @@ async def get_episode(
         name=result.get("name", ""),
         content=result.get("content", ""),
         source=result.get("source", "unknown"),
+        source_id=result.get("source_id"),
         source_description=result.get("source_description"),
         group_id=result.get("group_id"),
         entities=result.get("entities", []),
         facts=result.get("facts", []),
         created_at=result.get("created_at"),
         updated_at=result.get("updated_at"),
+        entity_count=len(result.get("entities", [])),
+        edge_count=len(result.get("facts", [])),
     )
 
 
@@ -85,7 +96,6 @@ async def delete_episode(
     service=Depends(get_synapse_service),
 ):
     """Delete an episode."""
-    # Use existing MCP method
     result = await service.delete_episode(episode_id=episode_id)
 
     return SuccessResponse(

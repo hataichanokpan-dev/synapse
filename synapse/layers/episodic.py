@@ -956,6 +956,101 @@ class EpisodicManager:
 
         return deleted
 
+    def update_episode(
+        self,
+        episode_id: str,
+        content: Optional[str] = None,
+        summary: Optional[str] = None,
+        topics: Optional[List[str]] = None,
+        outcome: Optional[str] = None,
+    ) -> Optional[SynapseEpisode]:
+        """
+        Update an episode.
+
+        Args:
+            episode_id: Episode identifier
+            content: New content (optional)
+            summary: New summary (optional)
+            topics: New topics list (optional)
+            outcome: New outcome (optional)
+
+        Returns:
+            Updated SynapseEpisode or None if not found
+        """
+        now = utcnow()
+        updated_row = None
+
+        with self._get_connection() as conn:
+            # Check if exists
+            cursor = conn.execute(
+                "SELECT * FROM episodes WHERE id = ?",
+                (episode_id,)
+            )
+            row = cursor.fetchone()
+
+            if row is None:
+                return None
+
+            # Build update query
+            updates = []
+            params = []
+
+            if content is not None:
+                updates.append("content = ?")
+                params.append(content)
+                # Also update FTS version
+                preprocessor = _get_nlp_preprocessor()
+                if preprocessor:
+                    content_fts = preprocessor.tokenize_for_fts(content)
+                else:
+                    content_fts = content
+                updates.append("content_fts = ?")
+                params.append(content_fts)
+
+            if summary is not None:
+                updates.append("summary = ?")
+                params.append(summary)
+                preprocessor = _get_nlp_preprocessor()
+                if preprocessor:
+                    summary_fts = preprocessor.tokenize_for_fts(summary)
+                else:
+                    summary_fts = summary
+                updates.append("summary_fts = ?")
+                params.append(summary_fts)
+
+            if topics is not None:
+                updates.append("topics = ?")
+                params.append(json.dumps(topics))
+
+            if outcome is not None:
+                updates.append("outcome = ?")
+                params.append(outcome)
+
+            if not updates:
+                # Nothing to update
+                return self._row_to_episode(row)
+
+            params.append(episode_id)
+
+            conn.execute(
+                f"UPDATE episodes SET {', '.join(updates)} WHERE id = ?",
+                params
+            )
+
+            # Get updated row
+            cursor = conn.execute(
+                "SELECT * FROM episodes WHERE id = ?",
+                (episode_id,)
+            )
+            updated_row = cursor.fetchone()
+
+        if updated_row:
+            episode = self._row_to_episode(updated_row)
+            self._index_episode(episode, access_count=updated_row["access_count"])
+            return episode
+
+        return None
+
     def _parse_datetime(self, dt_str: Optional[str]) -> Optional[datetime]:
         """Parse ISO format datetime string."""
         if dt_str is None:

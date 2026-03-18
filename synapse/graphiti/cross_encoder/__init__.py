@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from .client import CrossEncoderClient
+from .mock import MockCrossEncoderClient
 from .openai_reranker_client import OpenAIRerankerClient
 
-__all__ = ['CrossEncoderClient', 'OpenAIRerankerClient']
+__all__ = ['CrossEncoderClient', 'MockCrossEncoderClient', 'OpenAIRerankerClient']

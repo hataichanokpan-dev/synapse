@@ -12,7 +12,8 @@ Endpoints:
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 
-from api.deps import get_synapse_service
+from api.deps import get_synapse_service, get_event_bus
+from api.services.event_bus import FeedEventType
 from api.models import (
     ProcedureCreate,
     ProcedureResponse,
@@ -34,10 +35,12 @@ async def list_procedures(
     service=Depends(get_synapse_service),
 ):
     """List or find procedures."""
-    if trigger:
-        result = await service.find_procedures(trigger=trigger)
-    else:
-        result = []
+    result = await service.list_procedures(
+        trigger=trigger,
+        topic=topic,
+        limit=limit,
+        offset=offset,
+    )
 
     items = [
         ProcedureResponse(
@@ -46,15 +49,16 @@ async def list_procedures(
             steps=p.get("steps", []),
             topics=p.get("topics", []),
             source=p.get("source", "api"),
+            source_description=p.get("source_description"),
             success_count=p.get("success_count", 0),
             failure_count=p.get("failure_count", 0),
         )
-        for i, p in enumerate(result)
+        for i, p in enumerate(result.get("items", []))
     ]
 
     return ProcedureListResponse(
         items=items,
-        total=len(items),
+        total=result.get("total", len(items)),
         limit=limit,
         offset=offset,
     )
@@ -64,14 +68,28 @@ async def list_procedures(
 async def add_procedure(
     request: ProcedureCreate,
     service=Depends(get_synapse_service),
+    event_bus=Depends(get_event_bus),
 ):
     """Add a new procedure."""
-    result = await service.add_procedure(
+    result = service.add_procedure(
         trigger=request.trigger,
         steps=request.steps,
         topics=request.topics,
         source=request.source,
     )
+
+    # Emit feed event
+    if event_bus:
+        await event_bus.emit(
+            event_type=FeedEventType.PROCEDURE_ADD,
+            summary=f"Added procedure: {request.trigger}",
+            layer="PROCEDURAL",
+            detail={
+                "uuid": result.get("uuid"),
+                "trigger": request.trigger,
+                "steps": request.steps,
+            },
+        )
 
     return ProcedureResponse(
         uuid=result.get("uuid", "new"),
@@ -87,9 +105,26 @@ async def add_procedure(
 async def record_procedure_success(
     trigger: str,
     service=Depends(get_synapse_service),
+    event_bus=Depends(get_event_bus),
 ):
     """Record successful procedure execution."""
-    result = await service.record_procedure_success(trigger=trigger)
+    result = service.record_procedure_success(procedure_id=trigger)
+
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Procedure '{trigger}' not found")
+
+    # Emit feed event
+    if event_bus:
+        await event_bus.emit(
+            event_type=FeedEventType.PROCEDURE_SUCCESS,
+            summary=f"Procedure succeeded: {trigger}",
+            layer="PROCEDURAL",
+            detail={
+                "trigger": trigger,
+                "success_count": result.get("success_count", 1),
+            },
+        )
+
     return ProcedureSuccessResponse(
         uuid=result.get("uuid", trigger),
         trigger=trigger,
@@ -103,7 +138,6 @@ async def get_procedure(
     service=Depends(get_synapse_service),
 ):
     """Get procedure by ID."""
-    # GAP - needs direct DB access
     result = await service.get_procedure_by_id(procedure_id=procedure_id)
 
     if not result:
@@ -128,7 +162,6 @@ async def update_procedure(
     service=Depends(get_synapse_service),
 ):
     """Update a procedure."""
-    # GAP - needs direct DB access
     result = await service.update_procedure(
         procedure_id=procedure_id,
         trigger=request.trigger,
@@ -156,7 +189,6 @@ async def delete_procedure(
     service=Depends(get_synapse_service),
 ):
     """Delete a procedure."""
-    # GAP - needs direct DB access
     result = await service.delete_procedure(procedure_id=procedure_id)
 
     return SuccessResponse(

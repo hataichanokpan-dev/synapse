@@ -13,7 +13,8 @@ Endpoints:
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 
-from api.deps import get_synapse_service
+from api.deps import get_synapse_service, get_event_bus
+from api.services.event_bus import FeedEventType
 from api.models import (
     MemoryCreate,
     MemoryUpdate,
@@ -41,7 +42,6 @@ async def list_memories(
     service=Depends(get_synapse_service),
 ):
     """List memories with pagination."""
-    # GAP - needs direct DB access
     result = await service.list_memories(
         layer=layer,
         limit=limit,
@@ -79,7 +79,6 @@ async def get_memory(
     service=Depends(get_synapse_service),
 ):
     """Get memory by ID."""
-    # GAP - needs direct DB access
     result = await service.get_memory_by_id(memory_id=memory_id)
 
     if not result:
@@ -106,22 +105,40 @@ async def get_memory(
 async def add_memory(
     request: MemoryCreate,
     service=Depends(get_synapse_service),
+    event_bus=Depends(get_event_bus),
 ):
     """Add a new memory."""
     result = await service.add_memory(
         name=request.name,
-        content=request.content,
+        episode_body=request.content,
         source=request.source,
-        source_description=request.source_description,
-        layer=request.layer.value if request.layer else None,
+        source_description=request.source_description or "",
         group_id=request.group_id,
-        agent_id=request.agent_id,
-        metadata=request.metadata,
     )
 
+    # Emit feed event
+    if event_bus:
+        await event_bus.emit(
+            event_type=FeedEventType.MEMORY_ADD,
+            summary=f"Added memory: {request.name}",
+            layer=result.get("layer", "EPISODIC"),
+            detail={
+                "name": request.name,
+                "source": request.source,
+                "layer": result.get("layer"),
+            },
+        )
+
+    # Determine the layer from classification result
+    detected_layer = result.get("layer", "EPISODIC")
+    try:
+        layer_enum = MemoryLayer(detected_layer)
+    except ValueError:
+        layer_enum = request.layer or MemoryLayer.EPISODIC
+
     return MemoryResponse(
-        uuid=result.get("uuid", "unknown"),
-        layer=request.layer or MemoryLayer.EPISODIC,
+        uuid=result.get("uuid", ""),
+        layer=layer_enum,
         name=request.name,
         content=request.content,
         source=request.source,
@@ -140,24 +157,60 @@ async def search_memories(
     """Search memories across layers."""
     layers = [l.value for l in request.layers] if request.layers else None
 
-    result = await service.search_memory_layers(
+    result = await service.search_memory(
         query=request.query,
         layers=layers,
         limit=request.limit,
     )
 
-    results = [
-        MemorySearchResult(
-            uuid=r.get("uuid", ""),
-            layer=MemoryLayer(r.get("layer", "EPISODIC")),
-            name=r.get("name", ""),
-            content=r.get("content", ""),
-            score=r.get("score", 1.0),
-            highlight=r.get("highlight"),
-            metadata=r.get("metadata", {}),
-        )
-        for r in result.get("results", [])
-    ]
+    # Flatten layer results into a single list
+    results = []
+    for layer_name, layer_items in result.get("layers", {}).items():
+        for item in (layer_items if isinstance(layer_items, list) else []):
+            # Items may be dicts or model objects - handle both
+            if isinstance(item, dict):
+                uid = item.get("uuid", item.get("id", ""))
+                name = item.get("name", item.get("trigger", ""))
+                content = item.get("content", item.get("episode_body", ""))
+                score = item.get("score", 1.0)
+                highlight = item.get("highlight")
+                metadata = item.get("metadata", {})
+            else:
+                uid = str(getattr(item, 'uuid', getattr(item, 'id', '')))
+                name = getattr(item, 'name', getattr(item, 'trigger', ''))
+                content = getattr(item, 'content', getattr(item, 'episode_body', ''))
+                if hasattr(item, 'procedure') and not content:
+                    content = str(item.procedure)
+                score = getattr(item, 'score', 1.0)
+                highlight = None
+                metadata = {}
+
+            try:
+                layer_enum = MemoryLayer(layer_name.upper())
+            except ValueError:
+                layer_enum = MemoryLayer.EPISODIC
+
+            results.append(MemorySearchResult(
+                uuid=str(uid),
+                layer=layer_enum,
+                name=str(name),
+                content=str(content) if content else "",
+                score=float(score) if score else 1.0,
+                highlight=highlight,
+                metadata=metadata if isinstance(metadata, dict) else {},
+            ))
+
+    # Add Graphiti (semantic graph) results
+    for item in result.get("graphiti", []):
+        fact = getattr(item, 'fact', None) or getattr(item, 'name', str(item))
+        results.append(MemorySearchResult(
+            uuid=getattr(item, 'uuid', ""),
+            layer=MemoryLayer.SEMANTIC,
+            name=getattr(item, 'name', fact[:50] if isinstance(fact, str) else ""),
+            content=fact if isinstance(fact, str) else str(fact),
+            score=getattr(item, 'score', 1.0),
+            metadata={},
+        ))
 
     return MemorySearchResponse(
         results=results,
@@ -173,10 +226,13 @@ async def consolidate_memories(
     service=Depends(get_synapse_service),
 ):
     """Consolidate memories."""
+    criteria = {}
+    if request.topics:
+        criteria["topics"] = request.topics
     result = await service.consolidate(
-        source=request.source,
+        source=request.source or "episodic",
+        criteria=criteria or None,
         min_access_count=request.min_access_count,
-        topics=request.topics,
         dry_run=request.dry_run,
     )
 
@@ -195,7 +251,6 @@ async def update_memory(
     service=Depends(get_synapse_service),
 ):
     """Update a memory."""
-    # GAP - needs direct DB access
     result = await service.update_memory(
         memory_id=memory_id,
         content=request.content,
@@ -222,10 +277,18 @@ async def update_memory(
 async def delete_memory(
     memory_id: str,
     service=Depends(get_synapse_service),
+    event_bus=Depends(get_event_bus),
 ):
     """Delete a memory."""
-    # GAP - needs direct DB access
     result = await service.delete_memory(memory_id=memory_id)
+
+    # Emit feed event
+    if event_bus:
+        await event_bus.emit(
+            event_type=FeedEventType.MEMORY_DELETE,
+            summary=f"Deleted memory: {memory_id}",
+            detail={"uuid": memory_id},
+        )
 
     return SuccessResponse(
         status="ok",

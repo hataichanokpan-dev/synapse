@@ -49,7 +49,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
                 stack = traceback.format_exc()
 
             # Log the error
-            print(f"❌ Unhandled error: {error_msg}")
+            print(f"[ERROR] Unhandled error: {error_msg}")
             if settings.debug:
                 print(stack)
 

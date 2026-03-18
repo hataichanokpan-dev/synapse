@@ -63,10 +63,11 @@ services:
       # Database Configuration
       - FALKORDB_URI=redis://falkordb:6379
       - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
-      - FALKORDB_DATABASE=${FALKORDB_DATABASE:-synapse}
+      - FALKORDB_DATABASE=${FALKORDB_DATABASE:-user-bfipa}
+      - QDRANT_URL=http://qdrant:6333
 
       # Graphiti Configuration
-      - GRAPHITI_GROUP_ID=${GRAPHITI_GROUP_ID:-main}
+      - GRAPHITI_GROUP_ID=${GRAPHITI_GROUP_ID:-user-bfipa}
       - USER_ID=${USER_ID:-cerberus}
 
       # Performance

@@ -37,26 +37,30 @@ async def list_nodes(
     service=Depends(get_synapse_service),
 ):
     """List or search graph nodes."""
-    if query:
-        # Use search if query provided
-        result = await service.search_nodes(query=query, limit=limit)
-        nodes = result.get("nodes", [])
-    else:
-        # List all nodes (GAP - needs direct DB access)
-        nodes = []
+    result = await service.search_nodes(
+        query=query,
+        node_type=type,
+        limit=limit,
+        offset=offset,
+    )
+
+    nodes_data = result.get("nodes", [])
 
     return NodeListResponse(
         nodes=[
             NodeResponse(
-                uuid=n.get("uuid", str(i)),
+                uuid=n.get("uuid", ""),
                 name=n.get("name", ""),
-                type=n.get("type", "Entity"),
+                entity_type=n.get("entity_type", "concept"),
                 summary=n.get("summary"),
                 created_at=n.get("created_at"),
+                last_accessed=n.get("last_accessed"),
+                access_count=n.get("access_count", 0),
+                decay_score=n.get("decay_score"),
             )
-            for i, n in enumerate(nodes)
+            for n in nodes_data
         ],
-        total=len(nodes),
+        total=result.get("total", len(nodes_data)),
         limit=limit,
         offset=offset,
     )
@@ -68,7 +72,6 @@ async def get_node(
     service=Depends(get_synapse_service),
 ):
     """Get node details by ID."""
-    # GAP - needs direct FalkorDB access
     result = await service.get_node_by_id(node_id=node_id)
 
     if not result:
@@ -77,12 +80,15 @@ async def get_node(
     return NodeDetailResponse(
         uuid=result.get("uuid", node_id),
         name=result.get("name", ""),
-        type=result.get("type", "Entity"),
+        entity_type=result.get("entity_type", "concept"),
         summary=result.get("summary"),
         facts=result.get("facts", []),
         episodes=result.get("episodes", []),
         created_at=result.get("created_at"),
         updated_at=result.get("updated_at"),
+        last_accessed=result.get("last_accessed"),
+        access_count=result.get("access_count", 0),
+        decay_score=result.get("decay_score"),
     )
 
 
@@ -95,7 +101,6 @@ async def get_node_edges(
     service=Depends(get_synapse_service),
 ):
     """Get edges connected to a node."""
-    # GAP - needs direct FalkorDB access
     result = await service.get_node_edges(
         node_id=node_id,
         direction=direction,
@@ -108,16 +113,17 @@ async def get_node_edges(
     return EdgeListResponse(
         edges=[
             EdgeResponse(
-                uuid=e.get("uuid", str(i)),
+                uuid=e.get("uuid", ""),
                 source_id=e.get("source_id", ""),
                 target_id=e.get("target_id", ""),
-                type=e.get("type", "RELATES_TO"),
+                relation=e.get("relation", "RELATES_TO"),
                 fact=e.get("fact"),
+                confidence=e.get("confidence", 1.0),
                 created_at=e.get("created_at"),
             )
-            for i, e in enumerate(edges)
+            for e in edges
         ],
-        total=len(edges),
+        total=result.get("total", len(edges)),
         limit=limit,
         offset=0,
     )
@@ -131,7 +137,6 @@ async def list_edges(
     service=Depends(get_synapse_service),
 ):
     """List graph edges."""
-    # GAP - needs direct FalkorDB access
     result = await service.list_edges(edge_type=type, limit=limit, offset=offset)
 
     edges = result.get("edges", [])
@@ -139,14 +144,15 @@ async def list_edges(
     return EdgeListResponse(
         edges=[
             EdgeResponse(
-                uuid=e.get("uuid", str(i)),
+                uuid=e.get("uuid", ""),
                 source_id=e.get("source_id", ""),
                 target_id=e.get("target_id", ""),
-                type=e.get("type", "RELATES_TO"),
+                relation=e.get("relation", "RELATES_TO"),
                 fact=e.get("fact"),
+                confidence=e.get("confidence", 1.0),
                 created_at=e.get("created_at"),
             )
-            for i, e in enumerate(edges)
+            for e in edges
         ],
         total=result.get("total", len(edges)),
         limit=limit,
@@ -160,7 +166,6 @@ async def get_edge(
     service=Depends(get_synapse_service),
 ):
     """Get edge details by ID."""
-    # Use existing MCP method
     result = await service.get_entity_edge(edge_id=edge_id)
 
     if not result:
@@ -172,8 +177,9 @@ async def get_edge(
         target_id=result.get("target_id", ""),
         source_name=result.get("source_name", ""),
         target_name=result.get("target_name", ""),
-        type=result.get("type", "RELATES_TO"),
+        relation=result.get("relation", "RELATES_TO"),
         fact=result.get("fact"),
+        confidence=result.get("confidence", 1.0),
         episodes=result.get("episodes", []),
         created_at=result.get("created_at"),
     )
@@ -185,7 +191,6 @@ async def delete_node(
     service=Depends(get_synapse_service),
 ):
     """Delete a node and its edges."""
-    # GAP - needs direct FalkorDB + Qdrant access
     result = await service.delete_node(node_id=node_id)
 
     return SuccessResponse(
@@ -200,7 +205,6 @@ async def delete_edge(
     service=Depends(get_synapse_service),
 ):
     """Delete an edge."""
-    # Use existing MCP method
     result = await service.delete_entity_edge(edge_id=edge_id)
 
     return SuccessResponse(

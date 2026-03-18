@@ -39,24 +39,44 @@ async def consult(
         limit=request.limit,
     )
 
-    # Parse layer summaries
+    # Parse layer summaries - service returns {layer_name: [items]}
     layer_summaries = {}
     for layer_name, layer_data in result.get("layers", {}).items():
         try:
             layer_enum = MemoryLayer(layer_name.upper())
         except ValueError:
             continue
+
+        # layer_data is a list of items from search_all
+        items = layer_data if isinstance(layer_data, list) else []
+        top_results = []
+        for item in items[:5]:
+            if isinstance(item, dict):
+                top_results.append(item)
+            elif hasattr(item, "__dict__"):
+                top_results.append({"preview": str(item)[:200], "type": type(item).__name__})
+            else:
+                top_results.append({"preview": str(item)[:200]})
+
         layer_summaries[layer_name] = LayerSummary(
             layer=layer_enum,
-            count=layer_data.get("count", 0),
-            top_results=layer_data.get("top_results", []),
-            relevance_score=layer_data.get("relevance_score"),
+            count=len(items),
+            top_results=top_results,
+            relevance_score=None,
         )
+
+    # summary from service is a list of dicts with layer/count/top_result
+    summary_texts = []
+    for s in result.get("summary", []):
+        if isinstance(s, dict):
+            summary_texts.append(f"{s.get('layer', '')}: {s.get('count', 0)} results")
+        else:
+            summary_texts.append(str(s))
 
     return ConsultResponse(
         query=request.query,
         layers=layer_summaries,
-        summary=result.get("summary", []),
+        summary=summary_texts,
         suggestions=result.get("suggestions", []),
     )
 
@@ -71,19 +91,33 @@ async def reflect(
 
     result = await service.reflect(layer=layer)
 
-    insights = [
-        Insight(
-            content=i.get("content", ""),
-            layer=MemoryLayer(i.get("layer", "EPISODIC")),
-            source=i.get("source", "unknown"),
-            relevance=i.get("relevance", 1.0),
-        )
-        for i in result.get("insights", [])
-    ]
+    insights = []
+    for i in result.get("insights", []):
+        # Map service insight dicts to Insight model
+        insight_type = i.get("type", "unknown")
+        if insight_type == "procedure":
+            content = f"Procedure: {i.get('trigger', '')} → {i.get('steps', [])}"
+            source_layer = "PROCEDURAL"
+        elif insight_type == "episode":
+            content = i.get("summary") or i.get("content", "")
+            source_layer = "EPISODIC"
+        elif insight_type == "working_context":
+            content = f"{i.get('key', '')}: {i.get('value', '')}"
+            source_layer = "WORKING"
+        else:
+            content = str(i)
+            source_layer = "EPISODIC"
+
+        insights.append(Insight(
+            content=content,
+            layer=MemoryLayer(source_layer),
+            source=insight_type,
+            relevance=1.0,
+        ))
 
     return ReflectResponse(
         insights=insights[:request.count],
-        source_layer=layer or "all",
+        source_layer=result.get("source_layer", layer or "all"),
     )
 
 
@@ -96,7 +130,6 @@ async def analyze(
     result = await service.analyze_patterns(
         analysis_type=request.analysis_type.value,
         time_range_days=request.time_range_days,
-        group_id=request.group_id,
     )
 
     return AnalyzeResponse(

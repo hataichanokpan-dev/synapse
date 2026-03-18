@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload)",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(netstat -ano)",
+      "Bash(findstr :8000)",
+      "Bash(taskkill /PID 19412 /F)",
+      "Bash(cmd //c \"taskkill /PID 19412 /F\")",
+      "Bash(curl -s -X OPTIONS http://localhost:8000/api/feed/ -H 'Origin: http://localhost:3001' -H 'Access-Control-Request-Method: GET' -I)",
+      "Bash(curl -s http://localhost:8000/api/feed/?limit=50)",
+      "Bash(findstr LISTENING)",
+      "Bash(cmd //c \"taskkill /PID 9564 /F\")",
+      "Bash(curl -s -v http://localhost:8000/api/feed/?limit=50)",
+      "Bash(curl -s http://localhost:8000/api/feed/?limit=5)",
+      "Bash(curl -s -X OPTIONS http://localhost:8000/api/feed/ -H 'Origin: http://localhost:3000' -H 'Access-Control-Request-Method: GET' -I)"
+    ]
+  }
+}

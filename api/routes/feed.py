@@ -20,6 +20,20 @@ from api.models import (
 
 router = APIRouter(tags=["Feed"])
 
+# Map internal event types to frontend action types
+_TYPE_TO_ACTION = {
+    "MEMORY_ADD": "ADD",
+    "MEMORY_DELETE": "DELETE",
+    "MEMORY_SEARCH": "ACCESS",
+    "MEMORY_DECAY": "DECAY",
+    "CONSOLIDATION": "CONSOLIDATE",
+    "PROCEDURE_ADD": "ADD",
+    "PROCEDURE_SUCCESS": "ACCESS",
+    "IDENTITY_CHANGE": "ADD",
+    "MAINTENANCE": "ADD",
+    "SYSTEM_ERROR": "ADD",
+}
+
 
 @router.get("/", response_model=FeedEventListResponse)
 async def get_feed(
@@ -27,29 +41,82 @@ async def get_feed(
     limit: int = Query(50, ge=1, le=200),
     since: datetime = Query(None, description="Get events after this timestamp"),
     service=Depends(get_synapse_service),
+    event_bus=Depends(get_event_bus),
 ):
-    """Get recent feed events."""
-    # GAP - needs event log system
+    """Get recent feed events from real memory activity."""
+    events = []
+    existing_ids = set()
+
+    # First: pull from EventBus ring buffer (real-time events)
+    if event_bus is not None:
+        try:
+            bus_events = await event_bus.get_recent(
+                limit=limit,
+                layer=layer if layer and layer.upper() != "ALL" else None,
+                since=since,
+            )
+            for e in bus_events:
+                event_type = getattr(e, 'type', 'MEMORY_ADD')
+                if hasattr(event_type, 'value'):
+                    event_type = event_type.value
+                action = _TYPE_TO_ACTION.get(str(event_type).upper(), "ADD")
+                eid = str(getattr(e, 'id', ''))
+
+                events.append(FeedEvent(
+                    id=eid,
+                    type=str(event_type),
+                    layer=getattr(e, 'layer', None),
+                    action=action,
+                    summary=getattr(e, 'summary', ''),
+                    detail=getattr(e, 'detail', None),
+                    metadata=getattr(e, 'detail', None),
+                    timestamp=getattr(e, 'timestamp', datetime.utcnow()),
+                ))
+                existing_ids.add(eid)
+        except Exception:
+            pass  # EventBus may not support get_recent
+
+    # Second: pull from SynapseService (episodic layer + graph)
     result = await service.get_feed_events(
-        layer=layer,
+        layer=layer if layer and layer.upper() != "ALL" else None,
         limit=limit,
         since=since,
     )
 
-    events = result.get("events", [])
+    for e in result.get("events", []):
+        eid = e.get("id", "")
+        if eid in existing_ids:
+            continue
+
+        event_type = e.get("type", "MEMORY_ADD")
+        action = _TYPE_TO_ACTION.get(str(event_type).upper(), "ADD")
+
+        detail = e.get("detail", {}) or {}
+        metadata = {}
+        if detail.get("topics"):
+            metadata["topics"] = detail["topics"]
+        if detail.get("content"):
+            metadata["content"] = detail["content"]
+
+        events.append(FeedEvent(
+            id=eid,
+            type=event_type,
+            layer=e.get("layer"),
+            action=action,
+            summary=e.get("summary", ""),
+            title=e.get("summary", "")[:60] if e.get("summary") else None,
+            source=detail.get("source"),
+            detail=detail,
+            metadata=metadata or None,
+            timestamp=e.get("timestamp", datetime.utcnow()),
+        ))
+
+    # Sort by timestamp descending
+    events.sort(key=lambda x: x.timestamp, reverse=True)
+    events = events[:limit]
 
     return FeedEventListResponse(
-        events=[
-            FeedEvent(
-                id=e.get("id", str(i)),
-                type=e.get("type", "memory_added"),
-                layer=e.get("layer"),
-                summary=e.get("summary", ""),
-                detail=e.get("detail"),
-                timestamp=e.get("timestamp", datetime.utcnow()),
-            )
-            for i, e in enumerate(events)
-        ],
+        events=events,
         total=len(events),
         limit=limit,
     )

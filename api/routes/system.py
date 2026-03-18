@@ -87,7 +87,6 @@ async def clear_graph(
 @router.get("/stats", response_model=StatsResponse)
 async def get_stats(service=Depends(get_synapse_service)):
     """Get system statistics."""
-    # GAP - needs direct DB access for counts
     result = await service.get_system_stats()
 
     storage_data = result.get("storage", {})
@@ -123,7 +122,7 @@ async def run_maintenance(
 
     results = []
     for action in request.actions:
-        result = await service.run_maintenance(action=action.value)
+        result = await service.run_maintenance(action=action.value, dry_run=request.dry_run)
         results.append(MaintenanceResult(
             action=action,
             affected=result.get("affected", 0),
