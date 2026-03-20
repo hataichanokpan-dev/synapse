@@ -1,7 +1,7 @@
 # Synapse Development Workflow
 
-> **Note**: This document may contain outdated references to ChromaDB.
-> The current implementation uses **Qdrant** as the vector database.
+**Last Updated:** 2026-03-20
+**Vector DB:** Qdrant
 
 ## Overview
 
