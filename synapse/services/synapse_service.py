@@ -5,9 +5,10 @@ This class provides a unified API for MCP tools to interact with
 the 5-layer memory system while maintaining Graphiti compatibility.
 """
 
+import json
 import logging
 from datetime import datetime as dt
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from synapse.layers import (
@@ -22,18 +23,168 @@ from synapse.layers import (
 logger = logging.getLogger(__name__)
 
 
-def _parse_db_date(val) -> Optional[str]:
-    """Safely parse a datetime from DB into ISO string."""
+def _coerce_datetime(val: Any) -> Optional[datetime]:
+    """Parse supported datetime values into timezone-aware UTC datetimes."""
     if val is None:
         return None
+
     if isinstance(val, datetime):
-        return val.isoformat()
+        return val if val.tzinfo is not None else val.replace(tzinfo=timezone.utc)
+
     if isinstance(val, (int, float)):
-        return datetime.fromtimestamp(val / 1000 if val > 1e12 else val, tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(val / 1000 if val > 1e12 else val, tz=timezone.utc)
+
+    if isinstance(val, str):
+        value = val.strip()
+        if not value:
+            return None
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(value)
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            try:
+                numeric = float(value)
+            except ValueError:
+                return None
+            return datetime.fromtimestamp(
+                numeric / 1000 if numeric > 1e12 else numeric,
+                tz=timezone.utc,
+            )
+
+    return None
+
+
+def _parse_db_date(val) -> Optional[str]:
+    """Safely parse a datetime from DB into ISO string."""
+    parsed = _coerce_datetime(val)
+    if parsed is not None:
+        return parsed.isoformat()
+    if val is None:
+        return None
     try:
         return str(val)
     except Exception:
         return None
+
+
+def _normalize_feed_layer(layer: Any) -> Optional[str]:
+    """Normalize internal layer names into feed/UI layer names."""
+    if layer is None:
+        return None
+
+    raw = layer.value if hasattr(layer, "value") else str(layer)
+    normalized = raw.strip().lower().replace("-", "_")
+
+    aliases = {
+        "user": "USER",
+        "user_model": "USER",
+        "procedural": "PROCEDURAL",
+        "semantic": "SEMANTIC",
+        "episodic": "EPISODIC",
+        "working": "WORKING",
+        "all": "ALL",
+    }
+    return aliases.get(normalized)
+
+
+def _matches_feed_layer(event_layer: Any, requested_layer: Optional[str]) -> bool:
+    """Check whether an event belongs to the requested layer filter."""
+    normalized_request = _normalize_feed_layer(requested_layer)
+    if normalized_request in (None, "ALL"):
+        return True
+    return _normalize_feed_layer(event_layer) == normalized_request
+
+
+def _row_value(row: Any, *names: str) -> Any:
+    """Safely read values from sqlite rows or dict-like objects."""
+    if row is None:
+        return None
+
+    for name in names:
+        try:
+            if hasattr(row, "keys") and name in row.keys():
+                return row[name]
+        except Exception:
+            pass
+
+        try:
+            return row.get(name)
+        except Exception:
+            pass
+
+    return None
+
+
+def _parse_json_field(value: Any, default: Any) -> Any:
+    """Parse JSON strings with a fallback default."""
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return default
+    return default
+
+
+def _infer_graph_feed_layer(record: Dict[str, Any], created_at: Optional[datetime]) -> str:
+    """Infer a feed layer for raw Graphiti/Falkor records."""
+    explicit_layer = _normalize_feed_layer(record.get("layer") or record.get("memory_layer"))
+    if explicit_layer:
+        return explicit_layer
+
+    labels = {str(label).upper() for label in (record.get("labels") or [])}
+    text = " ".join(
+        str(part)
+        for part in (
+            record.get("name"),
+            record.get("content"),
+            record.get("source"),
+            record.get("source_description"),
+        )
+        if part
+    ).lower()
+
+    if any("WORKING" in label or "SESSION" in label for label in labels) or any(
+        term in text for term in ("working context", "session context", "current session", "current task")
+    ):
+        return "WORKING"
+
+    if any("USER" in label or "PREFERENCE" in label for label in labels) or any(
+        term in text for term in ("preference", "response style", "response length", "timezone", "expertise")
+    ):
+        return "USER"
+
+    if any("EPISODIC" in label or "EPISODE" in label for label in labels):
+        return "EPISODIC"
+
+    if created_at is not None and datetime.now(timezone.utc) - created_at <= timedelta(hours=24):
+        return "EPISODIC"
+
+    if any("PROCEDURE" in label or "WORKFLOW" in label for label in labels) or any(
+        term in text for term in ("procedure", "workflow", "trigger", "step 1")
+    ):
+        return "PROCEDURAL"
+
+    return "SEMANTIC"
+
+
+def _preview_feed_value(value: Any) -> str:
+    """Serialize feed detail values defensively."""
+    if isinstance(value, str):
+        return value
+
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
 
 
 class SynapseService:
@@ -195,42 +346,43 @@ class SynapseService:
             name=name,
         )
 
-        # Step 3: Store in Graphiti for knowledge graph
+        # Step 3: Store in Graphiti for knowledge graph (optional)
         graphiti_result = None
-        try:
-            # Import EpisodeType for source conversion
-            from graphiti_core.nodes import EpisodeType
-            from datetime import datetime as dt
+        if self.graphiti is not None:
+            try:
+                # Import EpisodeType for source conversion
+                from graphiti_core.nodes import EpisodeType
+                from datetime import datetime as dt
 
-            episode_type = EpisodeType.text  # Default
-            if source:
-                try:
-                    episode_type = EpisodeType[source.lower()]
-                except (KeyError, AttributeError):
-                    logger.warning(f"Unknown source type '{source}', using 'text' as default")
-                    episode_type = EpisodeType.text
+                episode_type = EpisodeType.text  # Default
+                if source:
+                    try:
+                        episode_type = EpisodeType[source.lower()]
+                    except (KeyError, AttributeError):
+                        logger.warning(f"Unknown source type '{source}', using 'text' as default")
+                        episode_type = EpisodeType.text
 
-            # Graphiti requires a valid reference_time, default to now if not provided
-            if reference_time is None:
-                reference_time = dt.now()
+                # Graphiti requires a valid reference_time, default to now if not provided
+                if reference_time is None:
+                    reference_time = dt.now()
 
-            # Graphiti requires a valid group_id (alphanumeric, dashes, underscores only)
-            # Default to 'default' if not provided
-            if group_id is None:
-                group_id = "default"
+                # Graphiti requires a valid group_id (alphanumeric, dashes, underscores only)
+                # Default to 'default' if not provided
+                if group_id is None:
+                    group_id = "default"
 
-            graphiti_result = await self.graphiti.add_episode(
-                name=name,
-                episode_body=episode_body,
-                source_description=source_description,
-                reference_time=reference_time,
-                group_id=group_id,
-                source=episode_type,
-                uuid=uuid,
-                **kwargs,
-            )
-        except Exception as e:
-            logger.error(f"Failed to store in Graphiti: {e}")
+                graphiti_result = await self.graphiti.add_episode(
+                    name=name,
+                    episode_body=episode_body,
+                    source_description=source_description,
+                    reference_time=reference_time,
+                    group_id=group_id,
+                    source=episode_type,
+                    uuid=uuid,
+                    **kwargs,
+                )
+            except Exception as e:
+                logger.error(f"Failed to store in Graphiti: {e}")
 
         return {
             "layer": detected_layer.value,
@@ -317,15 +469,16 @@ class SynapseService:
             user_id=self.user_id,
         )
 
-        # Search Graphiti
+        # Search Graphiti (optional)
         graphiti_results = []
-        try:
-            graphiti_results = await self.graphiti.search(
-                query=query,
-                num_results=limit,
-            )
-        except Exception as e:
-            logger.error(f"Graphiti search failed: {e}")
+        if self.graphiti is not None:
+            try:
+                graphiti_results = await self.graphiti.search(
+                    query=query,
+                    num_results=limit,
+                )
+            except Exception as e:
+                logger.error(f"Graphiti search failed: {e}")
 
         return {
             "layers": {k.value if hasattr(k, 'value') else str(k): v for k, v in layer_results.items()},
@@ -472,9 +625,13 @@ class SynapseService:
         response_style: Optional[str] = None,
         response_length: Optional[str] = None,
         timezone: Optional[str] = None,
-        add_expertise: Optional[Dict[str, str]] = None,
+        add_expertise: Optional[Dict[str, str] | List[str]] = None,
+        remove_expertise: Optional[List[str]] = None,
         add_topic: Optional[str] = None,
+        add_topics: Optional[List[str]] = None,
+        remove_topics: Optional[List[str]] = None,
         add_note: Optional[str] = None,
+        notes: Optional[str] = None,
         user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -485,36 +642,111 @@ class SynapseService:
             response_style: 'formal' | 'casual' | 'auto'
             response_length: 'concise' | 'detailed' | 'auto'
             timezone: User timezone (e.g., 'Asia/Bangkok')
-            add_expertise: Dict of {topic: level} to add
-            add_topic: Common topic to add
-            add_note: Free-form note to add
+            add_expertise: Dict of {topic: level} or List of topics (defaults to "unspecified" level)
+            remove_expertise: List of expertise topics to remove
+            add_topic: Single common topic to add (legacy)
+            add_topics: List of common topics to add
+            remove_topics: List of topics to remove
+            add_note: Free-form note to add (legacy)
+            notes: Replace notes content
             user_id: User identifier (uses default if not provided)
 
         Returns:
             Updated user context
         """
+        DEFAULT_EXPERTISE_LEVEL = "intermediate"
         uid = user_id or self.user_id
 
         # Build kwargs for update
         kwargs: Dict[str, Any] = {}
         if language:
-            kwargs['language'] = language
+            kwargs["language"] = language
         if response_style:
-            kwargs['response_style'] = response_style
+            kwargs["response_style"] = response_style
         if response_length:
-            kwargs['response_length'] = response_length
+            kwargs["response_length"] = response_length
         if timezone:
-            kwargs['timezone'] = timezone
-        if add_topic:
-            kwargs['add_topic'] = add_topic
-        if add_note:
-            kwargs['add_note'] = add_note
+            kwargs["timezone"] = timezone
 
-        # Handle expertise separately (need to merge with existing)
+        # Handle expertise - support both List[str] and Dict[str, str]
+        expertise_updates: Dict[str, str] = {}
         if add_expertise:
+            if isinstance(add_expertise, dict):
+                for topic, level in add_expertise.items():
+                    name = topic.strip()
+                    if name:
+                        expertise_updates[name] = level.strip() or DEFAULT_EXPERTISE_LEVEL
+            else:
+                # List[str] - convert to dict with default level
+                for topic in add_expertise:
+                    name = topic.strip() if isinstance(topic, str) else str(topic).strip()
+                    if name:
+                        expertise_updates[name] = DEFAULT_EXPERTISE_LEVEL
+
+        expertise_removals = {
+            topic.strip().casefold()
+            for topic in (remove_expertise or [])
+            if topic.strip()
+        }
+
+        if expertise_updates or expertise_removals:
             user = self.layers.get_user(uid)
-            merged_expertise = {**user.expertise, **add_expertise}
-            kwargs['expertise'] = merged_expertise
+            merged_expertise = {
+                topic: level
+                for topic, level in user.expertise.items()
+                if topic.casefold() not in expertise_removals
+            }
+            for topic, level in expertise_updates.items():
+                # Remove case-insensitive duplicates
+                for existing_topic in list(merged_expertise.keys()):
+                    if existing_topic.casefold() == topic.casefold():
+                        del merged_expertise[existing_topic]
+                        break
+                merged_expertise[topic] = level
+            kwargs["expertise"] = merged_expertise
+
+        # Handle topics - support both single add_topic and multiple add_topics
+        topics_to_add: List[str] = []
+        if add_topic and add_topic.strip():
+            topics_to_add.append(add_topic.strip())
+        for topic in add_topics or []:
+            name = topic.strip() if isinstance(topic, str) else str(topic).strip()
+            if name:
+                topics_to_add.append(name)
+
+        topics_to_remove = {
+            topic.strip().casefold()
+            for topic in (remove_topics or [])
+            if topic.strip()
+        }
+
+        if topics_to_add or topics_to_remove:
+            user = self.layers.get_user(uid)
+            merged_topics: List[str] = []
+            seen: set[str] = set()
+
+            for topic in user.common_topics:
+                key = topic.casefold()
+                if key in topics_to_remove or key in seen:
+                    continue
+                seen.add(key)
+                merged_topics.append(topic)
+
+            for topic in topics_to_add:
+                key = topic.casefold()
+                if key in topics_to_remove or key in seen:
+                    continue
+                seen.add(key)
+                merged_topics.append(topic)
+
+            kwargs["common_topics"] = merged_topics
+
+        # Handle notes
+        if notes is not None:
+            normalized_note = notes.strip()
+            kwargs["notes"] = [normalized_note] if normalized_note else []
+        elif add_note and add_note.strip():
+            kwargs["add_note"] = add_note.strip()
 
         # Perform update
         self.layers.update_user(uid, **kwargs)
@@ -1260,78 +1492,212 @@ class SynapseService:
         limit: int = 50,
         since: Optional[dt] = None,
     ) -> Dict[str, Any]:
-        """Get recent feed events from episodic layer + graph activity."""
+        """Get recent feed events across all five layers."""
         events = []
+        since_dt = _coerce_datetime(since)
+
+        def add_event(event: Dict[str, Any]) -> None:
+            event["layer"] = _normalize_feed_layer(event.get("layer")) or "SEMANTIC"
+            event_dt = _coerce_datetime(event.get("timestamp"))
+            if since_dt and event_dt and event_dt < since_dt:
+                return
+            if not _matches_feed_layer(event.get("layer"), layer):
+                return
+            event["timestamp"] = (
+                event_dt.isoformat() if event_dt else datetime.now(timezone.utc).isoformat()
+            )
+            events.append(event)
+
+        # Pull a user model snapshot into the feed when preferences exist
+        try:
+            user_manager = getattr(self.layers, "user_model", None)
+            user_row = None
+            candidate_user_ids = [self.get_full_user_key()]
+            if self.user_id not in candidate_user_ids:
+                candidate_user_ids.append(self.user_id)
+
+            if user_manager is not None and hasattr(user_manager, "_get_connection"):
+                with user_manager._get_connection() as conn:
+                    for candidate_id in candidate_user_ids:
+                        cursor = conn.execute(
+                            "SELECT * FROM user_models WHERE user_id = ?",
+                            (candidate_id,),
+                        )
+                        user_row = cursor.fetchone()
+                        if user_row is not None:
+                            break
+
+            if user_row is not None:
+                expertise = _parse_json_field(_row_value(user_row, "expertise"), {})
+                topics = _parse_json_field(_row_value(user_row, "common_topics"), [])
+                notes = _parse_json_field(_row_value(user_row, "notes"), [])
+
+                summary = "Updated user preferences"
+                if topics:
+                    summary = f"User topics: {', '.join(topics[:3])}"
+                elif expertise:
+                    summary = f"User expertise updated ({len(expertise)})"
+
+                add_event({
+                    "id": f"user:{_row_value(user_row, 'user_id')}",
+                    "type": "IDENTITY_CHANGE",
+                    "layer": _row_value(user_row, "layer", "memory_layer") or "USER",
+                    "summary": summary,
+                    "detail": {
+                        "user_id": _row_value(user_row, "user_id"),
+                        "language": _row_value(user_row, "language"),
+                        "response_style": _row_value(user_row, "response_style"),
+                        "response_length": _row_value(user_row, "response_length"),
+                        "timezone": _row_value(user_row, "timezone"),
+                        "expertise": expertise,
+                        "topics": topics,
+                        "notes": notes,
+                    },
+                    "timestamp": _row_value(user_row, "updated_at", "created_at"),
+                })
+        except Exception as e:
+            logger.warning(f"Failed to get user preferences for feed: {e}")
+
+        # Pull recent procedures from procedural storage
+        try:
+            procedural_manager = getattr(self.layers, "procedural", None)
+            if procedural_manager is not None and hasattr(procedural_manager, "_get_connection"):
+                with procedural_manager._get_connection() as conn:
+                    cursor = conn.execute(
+                        """
+                        SELECT id, trigger, procedure, source, success_count, last_used, topics,
+                               created_at, updated_at
+                        FROM procedures
+                        ORDER BY COALESCE(updated_at, created_at, last_used) DESC
+                        LIMIT ?
+                        """,
+                        (limit,),
+                    )
+
+                    for row in cursor:
+                        steps = _parse_json_field(_row_value(row, "procedure"), [])
+                        topics = _parse_json_field(_row_value(row, "topics"), [])
+                        add_event({
+                            "id": _row_value(row, "id"),
+                            "type": "PROCEDURE_ADD",
+                            "layer": _row_value(row, "layer", "memory_layer") or "PROCEDURAL",
+                            "summary": _row_value(row, "trigger") or "Procedure",
+                            "detail": {
+                                "trigger": _row_value(row, "trigger"),
+                                "steps": steps,
+                                "topics": topics,
+                                "source": _row_value(row, "source"),
+                                "success_count": _row_value(row, "success_count") or 0,
+                                "last_used": _parse_db_date(_row_value(row, "last_used")),
+                            },
+                            "timestamp": _row_value(row, "updated_at", "created_at", "last_used"),
+                        })
+        except Exception as e:
+            logger.warning(f"Failed to get procedures for feed: {e}")
 
         # Pull recent episodes as feed events
         try:
             episodes = self.layers.episodic.get_all_episodes(limit=limit)
             for ep in episodes:
-                recorded = ep.recorded_at
-                if since and recorded and recorded < since:
-                    continue
-
-                event_layer = "EPISODIC"
-                if ep.outcome == "procedure":
-                    event_layer = "PROCEDURAL"
-
-                if layer and layer.upper() != event_layer and layer.upper() != "ALL":
-                    continue
-
-                events.append({
+                explicit_layer = getattr(ep, "layer", None) or getattr(ep, "memory_layer", None)
+                add_event({
                     "id": ep.id,
                     "type": "MEMORY_ADD",
-                    "layer": event_layer,
+                    "layer": explicit_layer or "EPISODIC",
                     "summary": ep.summary or ep.content[:100],
                     "detail": {
                         "content": ep.content[:200],
                         "topics": ep.topics or [],
                         "outcome": ep.outcome,
                     },
-                    "timestamp": recorded.isoformat() if recorded else datetime.now(timezone.utc).isoformat(),
+                    "timestamp": ep.recorded_at,
                 })
         except Exception as e:
             logger.warning(f"Failed to get episodes for feed: {e}")
 
+        # Pull current working context snapshots
+        try:
+            working_manager = getattr(self.layers, "working", None)
+            working_entries = []
+            if working_manager is not None:
+                if hasattr(working_manager, "get_context_entries"):
+                    working_entries = working_manager.get_context_entries()
+                else:
+                    working_entries = list(getattr(working_manager, "_context", {}).values())
+
+            for ctx in working_entries:
+                metadata = getattr(ctx, "metadata", {}) or {}
+                value = getattr(ctx, "value", None)
+                value_preview = _preview_feed_value(value)
+                add_event({
+                    "id": f"working:{getattr(ctx, 'key', 'unknown')}",
+                    "type": "MEMORY_ADD",
+                    "layer": metadata.get("layer") or metadata.get("memory_layer") or "WORKING",
+                    "summary": f"Working context: {getattr(ctx, 'key', 'unknown')}",
+                    "detail": {
+                        "key": getattr(ctx, "key", None),
+                        "value": value,
+                        "content": value_preview[:200],
+                        "metadata": metadata,
+                        "access_count": getattr(ctx, "access_count", 0),
+                    },
+                    "timestamp": getattr(ctx, "updated_at", None) or getattr(ctx, "created_at", None),
+                })
+        except Exception as e:
+            logger.warning(f"Failed to get working context for feed: {e}")
+
         # Also pull recent graphiti episodes from FalkorDB
         try:
-            if self.graphiti and hasattr(self.graphiti, '_driver'):
-                driver = self.graphiti._driver
-                records, _, _ = await driver.execute_query(
-                    """
-                    MATCH (e:Episodic)
-                    RETURN e.uuid AS uuid, e.name AS name, e.content AS content,
-                           e.source AS source, e.source_description AS source_description,
-                           e.created_at AS created_at, e.group_id AS group_id
-                    ORDER BY e.created_at DESC
-                    LIMIT $limit
-                    """,
-                    limit=limit,
-                )
-                for record in records:
-                    ep_id = record.get("uuid", "")
-                    # Avoid duplicates with local episodes
-                    if any(e["id"] == ep_id for e in events):
-                        continue
+            if self.graphiti:
+                driver = getattr(self.graphiti, 'driver', None) or getattr(self.graphiti, '_driver', None)
+                if driver is not None:
+                    records, _, _ = await driver.execute_query(
+                        """
+                        MATCH (e)
+                        WHERE e.uuid IS NOT NULL
+                        RETURN e.uuid AS uuid, e.name AS name,
+                               COALESCE(e.summary, e.content, '') AS content,
+                               e.source AS source, e.source_description AS source_description,
+                               e.created_at AS created_at, e.group_id AS group_id,
+                               e.memory_layer AS memory_layer, e.layer AS layer,
+                               e.source_episode AS source_episode, labels(e) AS labels
+                        ORDER BY e.created_at DESC
+                        LIMIT $limit
+                        """,
+                        limit=limit,
+                    )
+                    seen_ids = {event["id"] for event in events}
+                    for record in records:
+                        ep_id = record.get("uuid", "")
+                        if ep_id in seen_ids:
+                            continue
 
-                    created = _parse_db_date(record.get("created_at"))
-                    events.append({
-                        "id": ep_id,
-                        "type": "MEMORY_ADD",
-                        "layer": "SEMANTIC",
-                        "summary": record.get("name", "Graph episode"),
-                        "detail": {
-                            "content": (record.get("content") or "")[:200],
-                            "source": record.get("source"),
-                            "source_description": record.get("source_description"),
-                        },
-                        "timestamp": created or datetime.now(timezone.utc).isoformat(),
-                    })
+                        created_dt = _coerce_datetime(record.get("created_at"))
+                        event_layer = _infer_graph_feed_layer(record, created_dt)
+                        add_event({
+                            "id": ep_id,
+                            "type": "MEMORY_ADD",
+                            "layer": event_layer,
+                            "summary": record.get("name", "Graph node"),
+                            "detail": {
+                                "content": (record.get("content") or "")[:200],
+                                "source": record.get("source"),
+                                "source_description": record.get("source_description"),
+                                "group_id": record.get("group_id"),
+                                "labels": record.get("labels") or [],
+                                "source_episode": record.get("source_episode"),
+                            },
+                            "timestamp": created_dt,
+                        })
+                        seen_ids.add(ep_id)
         except Exception as e:
             logger.debug(f"Could not fetch graph episodes for feed: {e}")
 
         # Sort by timestamp descending
-        events.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        events.sort(
+            key=lambda event: _coerce_datetime(event.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
         return {"events": events[:limit]}
 
     # ==================== Graph Methods ====================
@@ -1371,7 +1737,7 @@ class SynapseService:
                 uuid_list = list(node_uuids)
                 records, _, _ = await driver.execute_query(
                     """
-                    MATCH (n:Entity)
+                    MATCH (n)
                     WHERE n.uuid IN $uuids
                     RETURN n.uuid AS uuid, n.name AS name, n.summary AS summary,
                            n.created_at AS created_at, labels(n) AS labels
@@ -1380,11 +1746,42 @@ class SynapseService:
                     uuids=uuid_list,
                     limit=limit,
                 )
+
+                # Filter results by query relevance to name/summary
+                query_lower = query.lower()
+                filtered_records = []
+                for record in records:
+                    name = (record.get("name") or "").lower()
+                    summary = (record.get("summary") or "").lower()
+
+                    # Prioritize name matches, then summary matches
+                    if query_lower in name:
+                        filtered_records.insert(0, record)  # Name matches go first
+                    elif query_lower in summary:
+                        filtered_records.append(record)
+
+                # If filtering removed all results, use fuzzy match on name
+                if not filtered_records:
+                    # Try partial matching on name
+                    for record in records:
+                        name = (record.get("name") or "").lower()
+                        # Match any word in query
+                        if any(word in name for word in query_lower.split() if len(word) > 2):
+                            filtered_records.append(record)
+
+                # If still no results, return limited original results
+                if not filtered_records:
+                    filtered_records = records[:limit]
+                else:
+                    filtered_records = filtered_records[:limit]
+
+                records = filtered_records
             else:
-                # List all entity nodes
+                # List all entity nodes (use any label, not just :Entity)
                 records, _, _ = await driver.execute_query(
                     """
-                    MATCH (n:Entity)
+                    MATCH (n)
+                    WHERE n.uuid IS NOT NULL
                     RETURN n.uuid AS uuid, n.name AS name, n.summary AS summary,
                            n.created_at AS created_at, labels(n) AS labels
                     ORDER BY n.created_at DESC
@@ -1397,7 +1794,7 @@ class SynapseService:
 
             # Get total count
             count_records, _, _ = await driver.execute_query(
-                "MATCH (n:Entity) RETURN count(n) AS total",
+                "MATCH (n) WHERE n.uuid IS NOT NULL RETURN count(n) AS total",
             )
             total = count_records[0]["total"] if count_records else 0
 
@@ -2046,16 +2443,18 @@ class SynapseService:
         driver = await self._get_driver()
         if driver:
             try:
+                # Count all nodes (not just :Entity label)
                 records, _, _ = await driver.execute_query(
-                    "MATCH (n:Entity) RETURN count(n) AS count"
+                    "MATCH (n) RETURN count(n) AS count"
                 )
                 entity_count = records[0]["count"] if records else 0
             except Exception as e:
                 logger.debug(f"Could not count entities: {e}")
 
             try:
+                # Count all edges (not just :RELATES_TO)
                 records, _, _ = await driver.execute_query(
-                    "MATCH ()-[e:RELATES_TO]->() RETURN count(e) AS count"
+                    "MATCH ()-[e]->() RETURN count(e) AS count"
                 )
                 edge_count = records[0]["count"] if records else 0
             except Exception as e:

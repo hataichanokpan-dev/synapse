@@ -86,11 +86,11 @@ export function ProceduresView() {
   };
 
   // Delete procedure
-  const handleDeleteProcedure = async (trigger: string) => {
-    if (!confirm(`Delete procedure "${trigger}"?`)) return;
+  const handleDeleteProcedure = async (procedure: Procedure) => {
+    if (!confirm(`Delete procedure "${procedure.trigger}"?`)) return;
 
     try {
-      await api.deleteProcedure(trigger);
+      await api.deleteProcedure(procedure.uuid);
       loadProcedures();
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to delete procedure";
@@ -99,9 +99,9 @@ export function ProceduresView() {
   };
 
   // Record success
-  const handleRecordSuccess = async (trigger: string) => {
+  const handleRecordSuccess = async (procedureId: string) => {
     try {
-      await api.recordProcedureSuccess(trigger);
+      await api.recordProcedureSuccess(procedureId);
       loadProcedures();
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to record success";
@@ -360,7 +360,7 @@ export function ProceduresView() {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleRecordSuccess(procedure.trigger);
+                        handleRecordSuccess(procedure.uuid);
                       }}
                       className="p-1 text-success hover:bg-success/20 rounded transition-colors"
                       title="Record success"
@@ -370,7 +370,7 @@ export function ProceduresView() {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleDeleteProcedure(procedure.trigger);
+                        handleDeleteProcedure(procedure);
                       }}
                       className="p-1 text-error hover:bg-error/20 rounded transition-colors"
                       title="Delete"

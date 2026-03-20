@@ -107,22 +107,17 @@ async def update_preferences(
     service=Depends(get_synapse_service),
 ):
     """Update user preferences."""
-    updates = request.model_dump(exclude_unset=True, exclude_none=True)
-
-    # Map frontend field names to service params
-    kwargs = {}
-    if "language" in updates:
-        kwargs["language"] = updates["language"]
-    if "timezone" in updates:
-        kwargs["timezone"] = updates["timezone"]
-    if "response_style" in updates:
-        kwargs["response_style"] = updates["response_style"]
-    if "add_expertise" in updates and updates["add_expertise"]:
-        kwargs["add_expertise"] = updates["add_expertise"]
-    if "add_topics" in updates and updates["add_topics"]:
-        kwargs["add_topic"] = updates["add_topics"]
-
-    result = service.update_user_preferences(**kwargs)
+    # Pass fields directly to service - it now handles List[str] for expertise/topics
+    result = service.update_user_preferences(
+        language=request.language,
+        timezone=request.timezone,
+        response_style=request.response_style,
+        add_expertise=request.add_expertise,
+        remove_expertise=request.remove_expertise,
+        add_topics=request.add_topics,
+        remove_topics=request.remove_topics,
+        notes=request.notes,
+    )
 
     expertise_raw = result.get("expertise", [])
     expertise = list(expertise_raw.keys()) if isinstance(expertise_raw, dict) else list(expertise_raw)

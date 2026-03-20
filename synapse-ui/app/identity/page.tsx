@@ -8,7 +8,7 @@ import {
   CheckCircle,
   Trash2,
 } from "lucide-react";
-import { api } from "../../lib/api-client";
+import { api, type UpdatePreferencesRequest } from "../../lib/api-client";
 import type { UserContext, UserPreferences } from "../../lib/types";
 import { IdentityOfflineState, FormSkeleton } from "@/components/ui/empty-states";
 import clsx from "clsx";
@@ -71,7 +71,15 @@ export default function IdentityPage() {
     setSuccess(null);
 
     try {
-      await api.updatePreferences(preferences);
+      const request: UpdatePreferencesRequest = {
+        ...(preferences.language ? { language: preferences.language } : {}),
+        ...(preferences.timezone ? { timezone: preferences.timezone } : {}),
+        ...(preferences.response_style ? { response_style: preferences.response_style } : {}),
+        ...(preferences.expertise?.length ? { add_expertise: preferences.expertise } : {}),
+        ...(preferences.topics?.length ? { add_topics: preferences.topics } : {}),
+        ...(preferences.notes ? { notes: preferences.notes } : {}),
+      };
+      await api.updatePreferences(request);
       setSuccess("Preferences saved successfully");
       setTimeout(() => setSuccess(null), 3000);
     } catch (err) {
@@ -274,7 +282,7 @@ export default function IdentityPage() {
                 onChange={(e) =>
                   setPreferences((prev) => ({
                     ...prev,
-                    response_style: e.target.value as "concise" | "detailed" | undefined,
+                    response_style: (e.target.value || undefined) as UserPreferences["response_style"],
                   }))
                 }
                 className="w-full px-3 py-1.5 text-xs bg-bg-primary border border-border rounded-md
@@ -282,6 +290,7 @@ export default function IdentityPage() {
                   focus:outline-none focus:ring-1 focus:ring-accent"
               >
                 <option value="">Select style</option>
+                <option value="balanced">Balanced</option>
                 <option value="concise">Concise</option>
                 <option value="detailed">Detailed</option>
               </select>

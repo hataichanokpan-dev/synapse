@@ -195,6 +195,16 @@ class WorkingManager:
         with self._lock:
             return {k: v.value for k, v in self._context.items()}
 
+    def get_context_entries(self) -> List[WorkingContext]:
+        """
+        Get full working context entries including timestamps and metadata.
+
+        Returns:
+            List of WorkingContext objects
+        """
+        with self._lock:
+            return list(self._context.values())
+
     def get_context_keys(self) -> List[str]:
         """
         Get all context keys.

@@ -70,7 +70,16 @@ async def init_services():
     _event_bus = EventBus(buffer_size=settings.feed_buffer_size)
     print("[OK] EventBus initialized")
 
-    # Try to initialize real services
+    # Initialize SynapseService with LayerManager (SQLite-backed)
+    # This always works - no external dependencies
+    from synapse.services import SynapseService
+    from synapse.layers import LayerManager
+
+    layer_manager = LayerManager()
+    print("[OK] LayerManager initialized (SQLite-backed)")
+
+    # Try to initialize Graphiti for knowledge graph (optional)
+    _graphiti_client = None
     try:
         from graphiti_core import Graphiti
         from graphiti_core.driver.falkordb_driver import FalkorDriver
@@ -96,19 +105,20 @@ async def init_services():
             host=falkor_host,
             port=falkor_port,
             password=falkor_password if falkor_password else None,
+            database=falkor_database,  # Pass the database name!
         )
 
         # Create LLM config using OpenAI-compatible endpoint (Z.ai wrapper for Anthropic)
         llm_config = GraphitiLLMConfig(
             api_key=anthropic_api_key,
             base_url=anthropic_base_url,
-            model="claude-sonnet-4-20250514",  # Default model
+            model="claude-sonnet-4-20250514",  # Default model (Z.ai maps to GLM-4.7)
         )
 
-        # Create LLM client using OpenAI-compatible client (for Z.ai)
-        from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
-        llm_client = OpenAIGenericClient(config=llm_config, max_tokens=4096)
-        print(f"[OK] LLM Client created: {anthropic_base_url}")
+        # Create LLM client using custom ZaiClient (Anthropic format)
+        from synapse.graphiti.llm_client.zai_client import ZaiClient
+        llm_client = ZaiClient(config=llm_config, max_tokens=4096)
+        print(f"[OK] LLM Client created (ZaiClient): {anthropic_base_url}")
 
         # Create embedder - use local or OpenAI
         embedder_provider = os.getenv("EMBEDDER_PROVIDER", "openai")
@@ -148,21 +158,21 @@ async def init_services():
             embedder=embedder,
             cross_encoder=cross_encoder,
         )
-
-        # Initialize SynapseService
-        from synapse.services import SynapseService
-        _synapse_service = SynapseService(
-            graphiti_client=_graphiti_client,
-            user_id=os.getenv("USER_ID", "cerberus"),
-        )
-        print(f"[OK] SynapseService initialized (user: {_synapse_service.user_id})")
+        print("[OK] Graphiti client initialized (FalkorDB connected)")
 
     except Exception as e:
         import traceback
-        print(f"[DEV] Real services not available: {e}")
-        traceback.print_exc()
-        print("      Using mock service for development")
-        _synapse_service = MockSynapseService()
+        print(f"[INFO] Graphiti not available: {e}")
+        print("      Knowledge graph features will return empty data")
+        _graphiti_client = None
+
+    # Always initialize SynapseService with real LayerManager
+    _synapse_service = SynapseService(
+        graphiti_client=_graphiti_client,
+        layer_manager=layer_manager,
+        user_id=os.getenv("USER_ID", "cerberus"),
+    )
+    print(f"[OK] SynapseService initialized (user: {_synapse_service.user_id}, graphiti: {'yes' if _graphiti_client else 'no'})")
 
 
 async def shutdown_services():
@@ -181,132 +191,6 @@ async def shutdown_services():
     _event_bus = None
     _graphiti_client = None
     print("[OK] Services shut down")
-
-
-# Mock service for development
-class MockSynapseService:
-    """Mock SynapseService for development."""
-
-    # Identity methods (sync, not async)
-    def get_identity(self):
-        return {"user_id": "dev", "agent_id": None, "chat_id": None}
-
-    def set_identity(self, **kwargs):
-        return {"user_id": kwargs.get("user_id", "dev"), "agent_id": kwargs.get("agent_id"), "chat_id": kwargs.get("chat_id")}
-
-    def clear_identity(self):
-        return {"user_id": "dev", "agent_id": None, "chat_id": None}
-
-    def get_user_context(self):
-        return {
-            "user_id": "dev",
-            "language": "en",
-            "timezone": "UTC",
-            "response_style": "balanced",
-            "expertise": [],
-            "common_topics": [],
-            "notes": "",
-        }
-
-    def update_user_preferences(self, **kwargs):
-        result = self.get_user_context()
-        result.update(kwargs)
-        return result
-
-    # Memory methods (async)
-    async def add_memory(self, **kwargs):
-        return {"uuid": "mock-uuid", "layer": "EPISODIC"}
-
-    async def search_memory(self, query, **kwargs):
-        return {"layers": {}, "graphiti": []}
-
-    async def list_memories(self, layer=None, limit=20, offset=0, sort="created_at", order="desc"):
-        return {"items": [], "total": 0}
-
-    async def get_memory_by_id(self, memory_id):
-        return None
-
-    async def update_memory(self, memory_id, content=None, metadata=None):
-        return {"uuid": memory_id}
-
-    async def delete_memory(self, memory_id):
-        return {"message": f"Memory {memory_id} deleted (mock)"}
-
-    async def consolidate(self, **kwargs):
-        return {"promoted": [], "skipped": [], "errors": []}
-
-    # Procedure methods (async)
-    async def add_procedure(self, **kwargs):
-        return {"uuid": "mock-proc", "trigger": kwargs.get("trigger")}
-
-    async def list_procedures(self, trigger=None, topic=None, limit=20, offset=0):
-        return {"items": [], "total": 0}
-
-    async def get_procedure_by_id(self, procedure_id):
-        return None
-
-    async def update_procedure(self, procedure_id, **kwargs):
-        return {"uuid": procedure_id}
-
-    async def delete_procedure(self, procedure_id):
-        return {"message": f"Procedure {procedure_id} deleted (mock)"}
-
-    async def record_procedure_success(self, trigger):
-        return {"success_count": 1}
-
-    # Graph methods (async)
-    async def search_nodes(self, query, limit=50):
-        return {"nodes": []}
-
-    async def get_node_by_id(self, node_id):
-        return None
-
-    async def get_node_edges(self, node_id, direction="both", edge_type=None, limit=50):
-        return {"edges": []}
-
-    async def list_edges(self, edge_type=None, limit=50, offset=0):
-        return {"edges": [], "total": 0}
-
-    async def get_entity_edge(self, edge_id):
-        return None
-
-    async def delete_node(self, node_id):
-        return {"message": f"Node {node_id} deleted (mock)"}
-
-    async def delete_entity_edge(self, edge_id):
-        return {"message": f"Edge {edge_id} deleted (mock)"}
-
-    # Episodes methods (async)
-    async def get_episodes(self, group_id=None, limit=20, offset=0, sort="created_at", order="desc"):
-        return {"episodes": [], "total": 0}
-
-    async def get_episode_by_id(self, episode_id):
-        return None
-
-    async def delete_episode(self, episode_id):
-        return {"message": f"Episode {episode_id} deleted (mock)"}
-
-    # Feed methods (async)
-    async def get_feed_events(self, layer=None, limit=50, since=None):
-        return {"events": []}
-
-    # System methods (async)
-    async def get_status(self):
-        return {"status": "ok", "message": "Mock mode", "components": {"synapse": "ok"}}
-
-    async def get_system_stats(self):
-        return {
-            "entities": 0,
-            "edges": 0,
-            "episodes": 0,
-            "procedures": 0,
-            "episodic_items": 0,
-            "working_keys": 0,
-            "storage": {},
-        }
-
-    async def run_maintenance(self, action, dry_run=False):
-        return {"affected": 0, "message": f"Maintenance {action} completed (mock)"}
 
     async def clear_graph(self, confirm=False, group_ids=None):
         return {"status": "ok", "message": "Mock clear"}

@@ -8,8 +8,9 @@ Environment variables (all optional with defaults):
     DEBUG: Enable debug mode
 """
 
-from typing import List, Optional
+from typing import List, Optional, Union
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
 from functools import lru_cache
 
 
@@ -27,8 +28,8 @@ class Settings(BaseSettings):
     api_key: str = "synapse-dev-key"
     api_key_header: str = "X-API-Key"
 
-    # CORS
-    cors_origins: List[str] = [
+    # CORS - accept string or list, validator will convert
+    cors_origins: Union[str, List[str]] = [
         "http://localhost:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3000",
@@ -53,11 +54,13 @@ class Settings(BaseSettings):
         extra="ignore",  # Ignore extra env vars not defined here
     )
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Parse CORS origins if string
-        if isinstance(self.cors_origins, str):
-            self.cors_origins = [o.strip() for o in self.cors_origins.split(",")]
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v):
+        """Parse CORS origins from comma-separated string or list."""
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",") if origin.strip()]
+        return v
 
 
 @lru_cache

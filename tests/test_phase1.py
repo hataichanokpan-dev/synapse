@@ -8,7 +8,7 @@ Tests for:
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from synapse.services import SynapseService
 from synapse.services.synapse_service import SynapseService as SynapseServiceClass
@@ -20,6 +20,10 @@ from synapse.layers import (
     SynapseNode,
     SynapseEdge,
 )
+from synapse.layers.episodic import EpisodicManager
+from synapse.layers.procedural import ProceduralManager
+from synapse.layers.user_model import UserModelManager
+from synapse.layers.working import WorkingManager
 
 
 # ============================================
@@ -212,6 +216,67 @@ class TestSynapseService:
 
         assert "status" in result
         assert "components" in result
+
+    @pytest.mark.asyncio
+    async def test_get_feed_events_collects_all_layers(self, tmp_path):
+        """Feed should include durable events from all five layers."""
+        layer_manager = LayerManager(
+            user_model_manager=UserModelManager(db_path=tmp_path / "user.db"),
+            procedural_manager=ProceduralManager(
+                db_path=tmp_path / "procedural.db",
+                vector_client=MagicMock(),
+            ),
+            semantic_manager=MagicMock(),
+            episodic_manager=EpisodicManager(
+                db_path=tmp_path / "episodic.db",
+                vector_client=MagicMock(),
+            ),
+            working_manager=WorkingManager(),
+        )
+
+        graph_driver = AsyncMock()
+        graph_driver.execute_query.return_value = (
+            [
+                {
+                    "uuid": "graph-sem-1",
+                    "name": "Semantic node",
+                    "content": "Long-term fact",
+                    "source": "text",
+                    "source_description": "Entity type: concept",
+                    "created_at": (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(),
+                    "group_id": "default",
+                    "memory_layer": None,
+                    "layer": None,
+                    "source_episode": None,
+                    "labels": ["Entity"],
+                }
+            ],
+            None,
+            None,
+        )
+        graphiti_client = MagicMock()
+        graphiti_client.driver = graph_driver
+
+        service = SynapseService(
+            graphiti_client=graphiti_client,
+            layer_manager=layer_manager,
+            user_id="feed-user",
+        )
+
+        service.update_user_preferences(language="en", add_topics=["testing"])
+        service.add_procedure("deploy app", ["build", "release"])
+        service.layers.record_episode(
+            content="User asked about feed layers",
+            summary="Discussed feed layer coverage",
+            topics=["feed"],
+            outcome="success",
+        )
+        service.set_working_context("current_task", "fix feed")
+
+        result = await service.get_feed_events(limit=20)
+        layers = {event["layer"] for event in result["events"]}
+
+        assert {"USER", "PROCEDURAL", "EPISODIC", "WORKING", "SEMANTIC"} <= layers
 
 
 # ============================================

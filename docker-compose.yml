@@ -72,6 +72,8 @@ services:
 
       # Performance
       - SEMAPHORE_LIMIT=${SEMAPHORE_LIMIT:-10}
+    volumes:
+      - synapse_sqlite_data:/app/.synapse
     depends_on:
       falkordb:
         condition: service_healthy
@@ -93,6 +95,54 @@ services:
         reservations:
           memory: 2G
 
+  synapse-api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: synapse-api
+    ports:
+      - "${SYNAPSE_API_PORT:-8000}:8000"
+    environment:
+      - API_KEY=${SYNAPSE_API_KEY:-synapse-dev-key}
+      - SYNAPSE_API_KEY=${SYNAPSE_API_KEY:-synapse-dev-key}
+      - API_KEY_HEADER=${API_KEY_HEADER:-X-API-Key}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001}
+      - DEBUG=${DEBUG:-false}
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
+      - FALKORDB_URI=redis://falkordb:6379
+      - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
+      - FALKORDB_DATABASE=${FALKORDB_DATABASE:-user-bfipa}
+      - QDRANT_URL=http://qdrant:6333
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - EMBEDDER_PROVIDER=${EMBEDDER_PROVIDER:-openai}
+      - USER_ID=${USER_ID:-cerberus}
+      - FEED_BUFFER_SIZE=${FEED_BUFFER_SIZE:-500}
+    volumes:
+      - synapse_sqlite_data:/app/.synapse
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - synapse-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
 networks:
   synapse-network:
     driver: bridge
@@ -103,3 +153,5 @@ volumes:
     name: synapse-falkordb-data
   qdrant_data:
     name: synapse-qdrant-data
+  synapse_sqlite_data:
+    name: synapse-sqlite-data

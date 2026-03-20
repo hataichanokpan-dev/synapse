@@ -19,10 +19,12 @@ from .config import LLMConfig
 from .errors import RateLimitError
 from .openai_client import OpenAIClient
 from .token_tracker import TokenUsage, TokenUsageTracker
+from .zai_client import ZaiClient
 
 __all__ = [
     'LLMClient',
     'OpenAIClient',
+    'ZaiClient',
     'LLMConfig',
     'RateLimitError',
     'TokenUsage',

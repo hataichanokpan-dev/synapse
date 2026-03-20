@@ -121,8 +121,11 @@ const actionConfig = {
 };
 
 export function FeedEntryRow({ entry }: FeedEntryRowProps) {
-  const layer = layerConfig[entry.layer];
-  const action = actionConfig[entry.action];
+  // API returns lowercase, convert to uppercase for config lookup
+  const layerKey = entry.layer?.toUpperCase() as keyof typeof layerConfig;
+  const actionKey = entry.action?.toUpperCase() as keyof typeof actionConfig;
+  const layer = layerConfig[layerKey] || layerConfig.SEMANTIC; // fallback to SEMANTIC
+  const action = actionConfig[actionKey] || actionConfig.ADD; // fallback to ADD
   const LayerIcon = layer.icon;
   const ActionIcon = action.icon;
   const [showActions, setShowActions] = useState(false);

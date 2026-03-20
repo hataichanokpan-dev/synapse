@@ -12,6 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 
+from api.config import settings
 from api.deps import get_synapse_service, get_event_bus
 from api.models import (
     FeedEvent,
@@ -35,6 +36,24 @@ _TYPE_TO_ACTION = {
 }
 
 
+def _normalize_feed_layer(layer: Optional[str]) -> Optional[str]:
+    """Normalize feed layer names for the frontend."""
+    if layer is None:
+        return None
+
+    normalized = str(layer).strip().lower().replace("-", "_")
+    aliases = {
+        "user": "USER",
+        "user_model": "USER",
+        "procedural": "PROCEDURAL",
+        "semantic": "SEMANTIC",
+        "episodic": "EPISODIC",
+        "working": "WORKING",
+        "all": "ALL",
+    }
+    return aliases.get(normalized)
+
+
 @router.get("/", response_model=FeedEventListResponse)
 async def get_feed(
     layer: str = Query(None, description="Filter by memory layer"),
@@ -46,13 +65,13 @@ async def get_feed(
     """Get recent feed events from real memory activity."""
     events = []
     existing_ids = set()
+    normalized_filter = _normalize_feed_layer(layer)
 
     # First: pull from EventBus ring buffer (real-time events)
     if event_bus is not None:
         try:
             bus_events = await event_bus.get_recent(
-                limit=limit,
-                layer=layer if layer and layer.upper() != "ALL" else None,
+                limit=settings.feed_buffer_size,
                 since=since,
             )
             for e in bus_events:
@@ -61,11 +80,15 @@ async def get_feed(
                     event_type = event_type.value
                 action = _TYPE_TO_ACTION.get(str(event_type).upper(), "ADD")
                 eid = str(getattr(e, 'id', ''))
+                event_layer = _normalize_feed_layer(getattr(e, 'layer', None))
+
+                if normalized_filter not in (None, "ALL") and event_layer != normalized_filter:
+                    continue
 
                 events.append(FeedEvent(
                     id=eid,
                     type=str(event_type),
-                    layer=getattr(e, 'layer', None),
+                    layer=event_layer,
                     action=action,
                     summary=getattr(e, 'summary', ''),
                     detail=getattr(e, 'detail', None),
@@ -73,15 +96,22 @@ async def get_feed(
                     timestamp=getattr(e, 'timestamp', datetime.utcnow()),
                 ))
                 existing_ids.add(eid)
-        except Exception:
-            pass  # EventBus may not support get_recent
+        except Exception as e:
+            print(f"[DEBUG] EventBus error: {e}")
 
     # Second: pull from SynapseService (episodic layer + graph)
-    result = await service.get_feed_events(
-        layer=layer if layer and layer.upper() != "ALL" else None,
-        limit=limit,
-        since=since,
-    )
+    try:
+        result = await service.get_feed_events(
+            layer=layer if layer and layer.upper() != "ALL" else None,
+            limit=limit,
+            since=since,
+        )
+        print(f"[DEBUG] get_feed_events returned {len(result.get('events', []))} events")
+    except Exception as e:
+        print(f"[DEBUG] get_feed_events error: {e}")
+        import traceback
+        traceback.print_exc()
+        result = {"events": []}
 
     for e in result.get("events", []):
         eid = e.get("id", "")
@@ -101,7 +131,7 @@ async def get_feed(
         events.append(FeedEvent(
             id=eid,
             type=event_type,
-            layer=e.get("layer"),
+            layer=_normalize_feed_layer(e.get("layer")),
             action=action,
             summary=e.get("summary", ""),
             title=e.get("summary", "")[:60] if e.get("summary") else None,

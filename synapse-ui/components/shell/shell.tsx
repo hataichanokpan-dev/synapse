@@ -6,6 +6,7 @@ import { TopBar } from "./top-bar";
 import { CommandBar } from "./command-bar";
 import { Menu, X } from "lucide-react";
 import clsx from "clsx";
+import { api } from "../../lib/api-client";
 
 interface ShellProps {
   children: ReactNode;
@@ -39,24 +40,38 @@ export function Shell({ children }: ShellProps) {
 
     if (cmd === "status") {
       try {
-        const res = await fetch("/api/system/status");
-        const data = await res.json();
+        const data = await api.getStatus();
         setCommandResult(JSON.stringify(data, null, 2));
       } catch {
         setCommandResult("Error: Could not fetch status");
       }
+    } else if (cmd === "add") {
+      const content = parts.slice(1).join(" ").trim();
+      if (!content) {
+        setCommandResult("Usage: add <content>");
+      } else {
+        try {
+          const data = await api.addMemory({
+            name: content.slice(0, 50),
+            content,
+            source: "shell",
+          });
+          setCommandResult(JSON.stringify(data, null, 2));
+        } catch {
+          setCommandResult("Error: Add failed");
+        }
+      }
     } else if (cmd === "search") {
-      const query = parts.slice(1).join(" ");
-      try {
-        const res = await fetch("/api/memory/search", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query }),
-        });
-        const data = await res.json();
-        setCommandResult(JSON.stringify(data, null, 2));
-      } catch {
-        setCommandResult("Error: Search failed");
+      const query = parts.slice(1).join(" ").trim();
+      if (!query) {
+        setCommandResult("Usage: search <query>");
+      } else {
+        try {
+          const data = await api.searchMemory(query);
+          setCommandResult(JSON.stringify(data, null, 2));
+        } catch {
+          setCommandResult("Error: Search failed");
+        }
       }
     } else {
       setCommandResult(`Unknown command: ${cmd}`);
