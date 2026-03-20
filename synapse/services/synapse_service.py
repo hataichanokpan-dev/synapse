@@ -7,6 +7,7 @@ the 5-layer memory system while maintaining Graphiti compatibility.
 
 import json
 import logging
+import re
 from datetime import datetime as dt
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -187,6 +188,54 @@ def _preview_feed_value(value: Any) -> str:
         return str(value)
 
 
+def _normalize_core_layer(value: Any) -> Optional[MemoryLayer]:
+    """Normalize external layer values into core MemoryLayer enums."""
+    if value is None:
+        return None
+    if isinstance(value, MemoryLayer):
+        return value
+
+    raw = value.value if hasattr(value, "value") else value
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    try:
+        return MemoryLayer(text)
+    except ValueError:
+        return None
+
+
+def _normalize_core_layers(values: Optional[List[Any]]) -> Optional[List[MemoryLayer]]:
+    """Normalize a list of layer values into core MemoryLayer enums."""
+    if values is None:
+        return None
+
+    normalized: List[MemoryLayer] = []
+    for value in values:
+        layer = _normalize_core_layer(value)
+        if layer is not None:
+            normalized.append(layer)
+
+    return normalized
+
+
+def _sanitize_graph_group_id(group_id: Optional[str]) -> str:
+    """Sanitize group IDs for Graphiti/FalkorDB fulltext compatibility."""
+    if group_id is None:
+        return "default"
+    sanitized = re.sub(r"[^A-Za-z0-9_]+", "_", str(group_id).strip())
+    sanitized = sanitized.strip("_")
+    return sanitized or "default"
+
+
+def _sanitize_graph_group_ids(group_ids: Optional[List[str]]) -> Optional[List[str]]:
+    """Sanitize a list of group IDs for graph operations."""
+    if group_ids is None:
+        return None
+    return [_sanitize_graph_group_id(group_id) for group_id in group_ids]
+
+
 class SynapseService:
     """
     Unified service for Synapse memory operations.
@@ -221,6 +270,171 @@ class SynapseService:
         self.user_id = user_id
         self.agent_id = agent_id
         self.chat_id = chat_id
+
+    def _serialize_episode_memory(
+        self,
+        episode: Any,
+        *,
+        source: Optional[str] = None,
+        source_description: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Serialize episodic records into a consistent API/service envelope."""
+        recorded_at = _parse_db_date(getattr(episode, "recorded_at", None))
+        expires_at = _parse_db_date(getattr(episode, "expires_at", None))
+        summary = getattr(episode, "summary", None) or name or (getattr(episode, "content", "")[:50])
+        return {
+            "uuid": getattr(episode, "id", ""),
+            "layer": MemoryLayer.EPISODIC.value,
+            "name": summary or "",
+            "content": getattr(episode, "content", "") or "",
+            "source": source or "episodic",
+            "source_description": source_description or getattr(episode, "outcome", None) or "unknown",
+            "group_id": getattr(episode, "session_id", None),
+            "agent_id": getattr(episode, "user_id", None),
+            "access_count": getattr(episode, "access_count", 0),
+            "decay_score": None,
+            "created_at": recorded_at,
+            "updated_at": recorded_at,
+            "last_accessed": None,
+            "metadata": {
+                "summary": getattr(episode, "summary", None),
+                "topics": list(getattr(episode, "topics", []) or []),
+                "outcome": getattr(episode, "outcome", None) or "unknown",
+                "expires_at": expires_at,
+            },
+        }
+
+    def _serialize_procedure_memory(self, procedure: Any) -> Dict[str, Any]:
+        """Serialize procedural records into a consistent API/service envelope."""
+        steps = getattr(procedure, "procedure", []) or []
+        if not isinstance(steps, list):
+            steps = [str(steps)]
+        return {
+            "uuid": getattr(procedure, "id", ""),
+            "layer": MemoryLayer.PROCEDURAL.value,
+            "name": getattr(procedure, "trigger", "") or "",
+            "content": "\n".join(steps),
+            "source": getattr(procedure, "source", "explicit") or "explicit",
+            "source_description": f"Procedure: {getattr(procedure, 'trigger', '')}",
+            "group_id": None,
+            "agent_id": None,
+            "access_count": getattr(procedure, "success_count", 0),
+            "decay_score": getattr(procedure, "decay_score", 1.0),
+            "created_at": _parse_db_date(getattr(procedure, "created_at", None)),
+            "updated_at": _parse_db_date(getattr(procedure, "updated_at", None)),
+            "last_accessed": _parse_db_date(getattr(procedure, "last_used", None)),
+            "metadata": {
+                "trigger": getattr(procedure, "trigger", "") or "",
+                "steps": steps,
+                "topics": list(getattr(procedure, "topics", []) or []),
+            },
+        }
+
+    def _serialize_semantic_memory(
+        self,
+        node: SynapseNode,
+        *,
+        content: Optional[str] = None,
+        source: Optional[str] = None,
+        source_description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Serialize semantic records into a consistent API/service envelope."""
+        return {
+            "uuid": node.id,
+            "layer": MemoryLayer.SEMANTIC.value,
+            "name": node.name,
+            "content": node.summary or content or "",
+            "source": source or "semantic",
+            "source_description": source_description,
+            "group_id": None,
+            "agent_id": node.agent_id,
+            "access_count": node.access_count,
+            "decay_score": node.decay_score,
+            "created_at": _parse_db_date(node.created_at),
+            "updated_at": _parse_db_date(node.updated_at),
+            "last_accessed": None,
+            "metadata": {
+                "entity_type": node.type.value if hasattr(node.type, "value") else node.type,
+                "confidence": node.confidence,
+                "source_episode": node.source_episode,
+            },
+        }
+
+    def _serialize_user_memory(
+        self,
+        user: Any,
+        *,
+        content: Optional[str] = None,
+        source: Optional[str] = None,
+        source_description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Serialize user-model records into a consistent API/service envelope."""
+        notes = list(getattr(user, "notes", []) or [])
+        expertise = dict(getattr(user, "expertise", {}) or {})
+        topics = list(getattr(user, "common_topics", []) or [])
+        updated_at = _parse_db_date(getattr(user, "updated_at", None))
+        created_at = _parse_db_date(getattr(user, "created_at", None)) or updated_at
+        return {
+            "uuid": getattr(user, "user_id", self.user_id),
+            "layer": MemoryLayer.USER_MODEL.value,
+            "name": "User preferences",
+            "content": content or "\n".join(notes),
+            "source": source or "user_model",
+            "source_description": source_description or "User model update",
+            "group_id": None,
+            "agent_id": getattr(user, "agent_id", None),
+            "access_count": 0,
+            "decay_score": 1.0,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "last_accessed": None,
+            "metadata": {
+                "language": getattr(user, "language", None),
+                "response_style": getattr(user, "response_style", None),
+                "response_length": getattr(user, "response_length", None),
+                "timezone": getattr(user, "timezone", None),
+                "expertise": expertise,
+                "topics": topics,
+                "notes": notes,
+            },
+        }
+
+    def _serialize_memory_result(
+        self,
+        layer: MemoryLayer,
+        record: Any,
+        *,
+        name: Optional[str] = None,
+        content: Optional[str] = None,
+        source: Optional[str] = None,
+        source_description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Serialize a layer-specific record into the shared memory envelope."""
+        if layer == MemoryLayer.USER_MODEL:
+            return self._serialize_user_memory(
+                record,
+                content=content,
+                source=source,
+                source_description=source_description,
+            )
+        if layer == MemoryLayer.PROCEDURAL:
+            return self._serialize_procedure_memory(record)
+        if layer == MemoryLayer.SEMANTIC:
+            return self._serialize_semantic_memory(
+                record,
+                content=content,
+                source=source,
+                source_description=source_description,
+            )
+        if layer == MemoryLayer.EPISODIC:
+            return self._serialize_episode_memory(
+                record,
+                source=source,
+                source_description=source_description,
+                name=name,
+            )
+        raise ValueError(f"Unsupported memory layer: {layer}")
 
     # ============================================
     # IDENTITY MANAGEMENT
@@ -312,6 +526,9 @@ class SynapseService:
         group_id: Optional[str] = None,
         source: str = "text",
         uuid: Optional[str] = None,
+        layer: Optional[Any] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        agent_id: Optional[str] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -335,15 +552,28 @@ class SynapseService:
         Returns:
             Dict with layer info and Graphiti result
         """
-        # Step 1: Classify content
-        detected_layer = self.layers.detect_layer(episode_body)
+        requested_layer = _normalize_core_layer(layer)
+        detected_layer = requested_layer or self.layers.detect_layer(episode_body)
         logger.info(f"Content classified as: {detected_layer.value}")
 
         # Step 2: Route to appropriate layer
-        layer_result = await self._route_to_layer(
+        persisted_record = await self._route_to_layer(
             layer=detected_layer,
             content=episode_body,
             name=name,
+            source=source,
+            source_description=source_description,
+            group_id=group_id,
+            agent_id=agent_id,
+            metadata=metadata or {},
+        )
+        layer_result = self._serialize_memory_result(
+            detected_layer,
+            persisted_record,
+            name=name,
+            content=episode_body,
+            source=source,
+            source_description=source_description,
         )
 
         # Step 3: Store in Graphiti for knowledge graph (optional)
@@ -363,20 +593,18 @@ class SynapseService:
                         episode_type = EpisodeType.text
 
                 # Graphiti requires a valid reference_time, default to now if not provided
-                if reference_time is None:
-                    reference_time = dt.now()
+                resolved_reference_time = _coerce_datetime(reference_time) or datetime.now(timezone.utc)
 
                 # Graphiti requires a valid group_id (alphanumeric, dashes, underscores only)
                 # Default to 'default' if not provided
-                if group_id is None:
-                    group_id = "default"
+                resolved_group_id = _sanitize_graph_group_id(group_id)
 
                 graphiti_result = await self.graphiti.add_episode(
                     name=name,
                     episode_body=episode_body,
                     source_description=source_description,
-                    reference_time=reference_time,
-                    group_id=group_id,
+                    reference_time=resolved_reference_time,
+                    group_id=resolved_group_id,
                     source=episode_type,
                     uuid=uuid,
                     **kwargs,
@@ -385,9 +613,10 @@ class SynapseService:
                 logger.error(f"Failed to store in Graphiti: {e}")
 
         return {
-            "layer": detected_layer.value,
+            **layer_result,
             "layer_result": layer_result,
             "graphiti_result": graphiti_result,
+            "source_url": source_url,
         }
 
     async def _route_to_layer(
@@ -395,8 +624,14 @@ class SynapseService:
         layer: MemoryLayer,
         content: str,
         name: str,
+        source: str = "text",
+        source_description: str = "",
+        group_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Route content to appropriate layer handler."""
+        metadata = metadata or {}
 
         if layer == MemoryLayer.USER_MODEL:
             # Extract user preference from content
@@ -407,10 +642,16 @@ class SynapseService:
 
         elif layer == MemoryLayer.PROCEDURAL:
             # Extract trigger and steps (simplified for now)
-            # TODO: Use LLM to extract structured procedure
-            trigger = name
-            steps = [content]
-            return self.layers.learn_procedure(trigger, steps)
+            trigger = metadata.get("trigger") or name
+            steps = metadata.get("steps")
+            if steps is None:
+                steps = [content]
+            elif not isinstance(steps, list):
+                steps = [str(steps)]
+            topics = metadata.get("topics")
+            if topics is not None and not isinstance(topics, list):
+                topics = [str(topics)]
+            return self.layers.learn_procedure(trigger, steps, topics=topics or [])
 
         elif layer == MemoryLayer.SEMANTIC:
             # Store as entity
@@ -422,10 +663,16 @@ class SynapseService:
 
         elif layer == MemoryLayer.EPISODIC:
             # Store as episode
-            return self.layers.record_episode(
+            topics = metadata.get("topics")
+            if topics is not None and not isinstance(topics, list):
+                topics = [str(topics)]
+            return self.layers.episodic.record_episode(
                 content=content,
-                source="user_input",
-                metadata={"name": name},
+                summary=name,
+                topics=topics,
+                outcome=metadata.get("outcome") or "unknown",
+                user_id=agent_id or self.user_id,
+                session_id=group_id,
             )
 
         elif layer == MemoryLayer.WORKING:
@@ -461,10 +708,12 @@ class SynapseService:
         Returns:
             Dict with results per layer and Graphiti results
         """
+        normalized_layers = _normalize_core_layers(layers)
+
         # Search layers
         layer_results = await self.layers.search_all(
             query=query,
-            layers=layers,
+            layers=normalized_layers,
             limit_per_layer=limit,
             user_id=self.user_id,
         )
@@ -662,8 +911,12 @@ class SynapseService:
         if language:
             kwargs["language"] = language
         if response_style:
+            if str(response_style).strip().lower() == "balanced":
+                response_style = "auto"
             kwargs["response_style"] = response_style
         if response_length:
+            if str(response_length).strip().lower() == "balanced":
+                response_length = "auto"
             kwargs["response_length"] = response_length
         if timezone:
             kwargs["timezone"] = timezone
@@ -780,14 +1033,13 @@ class SynapseService:
             topics=topics or [],
         )
 
-        return {
-            "id": procedure.id,
-            "trigger": procedure.trigger,
-            "steps": procedure.procedure,
-            "topics": procedure.topics,
-            "source": procedure.source,
-            "success_count": procedure.success_count,
-        }
+        result = self._serialize_procedure_memory(procedure)
+        result["id"] = result["uuid"]
+        result["trigger"] = procedure.trigger
+        result["steps"] = list(procedure.procedure)
+        result["topics"] = list(procedure.topics or [])
+        result["success_count"] = procedure.success_count
+        return result
 
     def record_procedure_success(self, procedure_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -804,12 +1056,12 @@ class SynapseService:
         if procedure is None:
             return None
 
-        return {
-            "id": procedure.id,
-            "trigger": procedure.trigger,
-            "success_count": procedure.success_count,
-            "last_used": procedure.last_used.isoformat() if procedure.last_used else None,
-        }
+        result = self._serialize_procedure_memory(procedure)
+        result["id"] = result["uuid"]
+        result["trigger"] = procedure.trigger
+        result["success_count"] = procedure.success_count
+        result["last_used"] = procedure.last_used.isoformat() if procedure.last_used else None
+        return result
 
     def get_all_working_context(self) -> Dict[str, Any]:
         """Get all working memory context."""
@@ -889,22 +1141,7 @@ class SynapseService:
         Returns:
             Dict with guidance from each layer, ranked by relevance
         """
-        from synapse.layers import MemoryLayer
-
-        # Convert string layer names to MemoryLayer enums
-        target_layers = None
-        if layers:
-            target_layers = []
-            layer_map = {
-                'user_model': MemoryLayer.USER_MODEL,
-                'procedural': MemoryLayer.PROCEDURAL,
-                'semantic': MemoryLayer.SEMANTIC,
-                'episodic': MemoryLayer.EPISODIC,
-                'working': MemoryLayer.WORKING,
-            }
-            for layer_name in layers:
-                if layer_name.lower() in layer_map:
-                    target_layers.append(layer_map[layer_name.lower()])
+        target_layers = _normalize_core_layers(layers)
 
         # Search all specified layers
         results = await self.layers.search_all(
@@ -1179,53 +1416,21 @@ class SynapseService:
             Dict with 'items' list and 'total' count
         """
         items = []
-        total = 0
+        normalized_layer = _normalize_core_layer(layer)
+        if layer is not None and normalized_layer is None:
+            return {"items": [], "total": 0, "limit": limit, "offset": offset}
 
         # Collect from episodic layer
-        if layer is None or layer.lower() == "episodic":
+        if normalized_layer in (None, MemoryLayer.EPISODIC):
             episodes = self.layers.episodic.get_all_episodes(limit=1000)
             for ep in episodes:
-                items.append({
-                    "uuid": ep.id,
-                    "layer": "EPISODIC",
-                    "name": ep.summary or ep.content[:50],
-                    "content": ep.content,
-                    "source": "episodic",
-                    "source_description": ep.outcome,
-                    "group_id": ep.session_id,
-                    "agent_id": ep.user_id,
-                    "created_at": ep.recorded_at.isoformat() if ep.recorded_at else None,
-                    "updated_at": ep.recorded_at.isoformat() if ep.recorded_at else None,
-                    "access_count": 0,  # Episodes don't track access count the same way
-                    "metadata": {
-                        "topics": ep.topics,
-                        "outcome": ep.outcome,
-                        "expires_at": ep.expires_at.isoformat() if ep.expires_at else None,
-                    },
-                })
+                items.append(self._serialize_episode_memory(ep))
 
         # Collect from procedural layer
-        if layer is None or layer.lower() == "procedural":
+        if normalized_layer in (None, MemoryLayer.PROCEDURAL):
             procedures = self.layers.procedural.get_all_procedures(limit=1000)
             for proc in procedures:
-                items.append({
-                    "uuid": proc.id,
-                    "layer": "PROCEDURAL",
-                    "name": proc.trigger,
-                    "content": "\n".join(proc.procedure) if isinstance(proc.procedure, list) else str(proc.procedure),
-                    "source": proc.source,
-                    "source_description": f"Procedure: {proc.trigger}",
-                    "group_id": None,
-                    "agent_id": None,
-                    "created_at": proc.created_at.isoformat() if hasattr(proc, 'created_at') and proc.created_at else None,
-                    "updated_at": proc.updated_at.isoformat() if hasattr(proc, 'updated_at') and proc.updated_at else None,
-                    "access_count": proc.success_count,
-                    "metadata": {
-                        "trigger": proc.trigger,
-                        "steps": proc.procedure,
-                        "topics": proc.topics,
-                    },
-                })
+                items.append(self._serialize_procedure_memory(proc))
 
         # Sort items
         reverse = order.lower() == "desc"
@@ -1263,46 +1468,12 @@ class SynapseService:
         # Try episodic layer first
         episode = self.layers.episodic.get_episode(memory_id)
         if episode:
-            return {
-                "uuid": episode.id,
-                "layer": "EPISODIC",
-                "name": episode.summary or episode.content[:50],
-                "content": episode.content,
-                "source": "episodic",
-                "source_description": episode.outcome,
-                "group_id": episode.session_id,
-                "agent_id": episode.user_id,
-                "created_at": episode.recorded_at.isoformat() if episode.recorded_at else None,
-                "updated_at": episode.recorded_at.isoformat() if episode.recorded_at else None,
-                "access_count": 0,
-                "metadata": {
-                    "topics": episode.topics,
-                    "outcome": episode.outcome,
-                    "expires_at": episode.expires_at.isoformat() if episode.expires_at else None,
-                },
-            }
+            return self._serialize_episode_memory(episode)
 
         # Try procedural layer
         procedure = self.layers.procedural.get_procedure(memory_id)
         if procedure:
-            return {
-                "uuid": procedure.id,
-                "layer": "PROCEDURAL",
-                "name": procedure.trigger,
-                "content": "\n".join(procedure.procedure) if isinstance(procedure.procedure, list) else str(procedure.procedure),
-                "source": procedure.source,
-                "source_description": f"Procedure: {procedure.trigger}",
-                "group_id": None,
-                "agent_id": None,
-                "created_at": procedure.created_at.isoformat() if hasattr(procedure, 'created_at') and procedure.created_at else None,
-                "updated_at": procedure.updated_at.isoformat() if hasattr(procedure, 'updated_at') and procedure.updated_at else None,
-                "access_count": procedure.success_count,
-                "metadata": {
-                    "trigger": procedure.trigger,
-                    "steps": procedure.procedure,
-                    "topics": procedure.topics,
-                },
-            }
+            return self._serialize_procedure_memory(procedure)
 
         return None
 
@@ -1326,22 +1497,36 @@ class SynapseService:
         # Try episodic layer
         episode = self.layers.episodic.get_episode(memory_id)
         if episode:
-            # Episodic layer doesn't have direct update, so we update via raw DB
+            metadata = metadata or {}
+            topics = metadata.get("topics")
+            if topics is not None and not isinstance(topics, list):
+                topics = [str(topics)]
             updated = self.layers.episodic.update_episode(
                 episode_id=memory_id,
                 content=content,
-                metadata=metadata,
+                summary=metadata.get("summary"),
+                topics=topics,
+                outcome=metadata.get("outcome"),
             )
             if updated:
-                return await self.get_memory_by_id(memory_id)
+                return self._serialize_episode_memory(updated)
             return None
 
         # Try procedural layer
         procedure = self.layers.procedural.get_procedure(memory_id)
         if procedure:
-            steps = metadata.get("steps") if metadata else None
-            topics = metadata.get("topics") if metadata else None
-            trigger = metadata.get("trigger") if metadata else None
+            metadata = metadata or {}
+            steps = metadata.get("steps")
+            if steps is None and content is not None:
+                steps = [content]
+            elif steps is not None and not isinstance(steps, list):
+                steps = [str(steps)]
+
+            topics = metadata.get("topics")
+            if topics is not None and not isinstance(topics, list):
+                topics = [str(topics)]
+
+            trigger = metadata.get("trigger")
 
             updated = self.layers.procedural.update_procedure(
                 procedure_id=memory_id,
@@ -1350,7 +1535,7 @@ class SynapseService:
                 topics=topics,
             )
             if updated:
-                return await self.get_memory_by_id(memory_id)
+                return self._serialize_procedure_memory(updated)
             return None
 
         return None
@@ -2057,7 +2242,10 @@ class SynapseService:
         """Delete a node and its edges from FalkorDB."""
         driver = await self._get_driver()
         if driver is None:
-            return {"message": f"Node {node_id} deleted (no driver)"}
+            return {
+                "available": False,
+                "message": "Graph driver unavailable",
+            }
 
         try:
             # Delete node and all connected edges
@@ -2072,17 +2260,26 @@ class SynapseService:
                 uuid=node_id,
             )
             edge_count = records[0]["edge_count"] if records else 0
-            return {"message": f"Node {node_id} and {edge_count} edges deleted"}
+            return {
+                "available": True,
+                "message": f"Node {node_id} and {edge_count} edges deleted",
+            }
 
         except Exception as e:
             logger.error(f"Failed to delete node {node_id}: {e}")
-            return {"message": f"Failed to delete node {node_id}: {e}"}
+            return {
+                "available": True,
+                "message": f"Failed to delete node {node_id}: {e}",
+            }
 
     async def delete_entity_edge(self, edge_id: str) -> Dict[str, Any]:
         """Delete an edge from FalkorDB."""
         driver = await self._get_driver()
         if driver is None:
-            return {"message": f"Edge {edge_id} deleted (no driver)"}
+            return {
+                "available": False,
+                "message": "Graph driver unavailable",
+            }
 
         try:
             await driver.execute_query(
@@ -2092,11 +2289,78 @@ class SynapseService:
                 """,
                 uuid=edge_id,
             )
-            return {"message": f"Edge {edge_id} deleted"}
+            return {
+                "available": True,
+                "message": f"Edge {edge_id} deleted",
+            }
 
         except Exception as e:
             logger.error(f"Failed to delete edge {edge_id}: {e}")
-            return {"message": f"Failed to delete edge {edge_id}: {e}"}
+            return {
+                "available": True,
+                "message": f"Failed to delete edge {edge_id}: {e}",
+            }
+
+    async def clear_graph(
+        self,
+        confirm: bool = False,
+        group_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Clear graph data when a graph driver is available."""
+        if not confirm:
+            return {
+                "available": True,
+                "message": "confirm=true required for this destructive operation",
+                "nodes_deleted": 0,
+                "edges_deleted": 0,
+            }
+
+        driver = await self._get_driver()
+        if driver is None:
+            return {
+                "available": False,
+                "message": "Graph driver unavailable",
+                "nodes_deleted": 0,
+                "edges_deleted": 0,
+            }
+
+        node_query = "MATCH (n) RETURN count(n) AS count"
+        edge_query = "MATCH ()-[e]->() RETURN count(e) AS count"
+        params: Dict[str, Any] = {}
+        normalized_group_ids = _sanitize_graph_group_ids(group_ids)
+
+        if normalized_group_ids:
+            params["group_ids"] = normalized_group_ids
+            node_query = """
+                MATCH (n)
+                WHERE n.group_id IN $group_ids
+                RETURN count(n) AS count
+            """
+            edge_query = """
+                MATCH (a)-[e]->(b)
+                WHERE a.group_id IN $group_ids OR b.group_id IN $group_ids
+                RETURN count(e) AS count
+            """
+
+        try:
+            from synapse.graphiti.utils.maintenance.graph_data_operations import clear_data
+
+            node_records, _, _ = await driver.execute_query(node_query, **params)
+            edge_records, _, _ = await driver.execute_query(edge_query, **params)
+            nodes_deleted = node_records[0]["count"] if node_records else 0
+            edges_deleted = edge_records[0]["count"] if edge_records else 0
+
+            await clear_data(driver, group_ids=normalized_group_ids)
+
+            return {
+                "available": True,
+                "message": "Graph cleared",
+                "nodes_deleted": nodes_deleted,
+                "edges_deleted": edges_deleted,
+            }
+        except Exception as e:
+            logger.error(f"Failed to clear graph: {e}")
+            raise
 
     # ==================== Episode Methods ====================
 
@@ -2133,9 +2397,10 @@ class SynapseService:
             try:
                 query_params = {"limit": limit + offset + 50}  # fetch extra for merge
                 group_filter = ""
+                normalized_group_id = _sanitize_graph_group_id(group_id) if group_id else None
                 if group_id:
                     group_filter = "WHERE e.group_id = $group_id"
-                    query_params["group_id"] = group_id
+                    query_params["group_id"] = normalized_group_id
 
                 order_clause = "DESC" if order == "desc" else "ASC"
                 records, _, _ = await driver.execute_query(
@@ -2506,33 +2771,43 @@ class SynapseService:
         """Run maintenance tasks with real effects."""
         affected = 0
         message = ""
+        normalized_action = str(action).strip().lower().replace("-", "_")
+        action_aliases = {
+            "decay_refresh": "decay_refresh",
+            "purge_expired": "purge_expired",
+            "vacuum_sqlite": "vacuum_sqlite",
+            "rebuild_fts": "rebuild_fts",
+            "decayrefresh": "decay_refresh",
+            "purgeexpired": "purge_expired",
+            "vacuumsqlite": "vacuum_sqlite",
+            "rebuildfts": "rebuild_fts",
+        }
+        normalized_action = action_aliases.get(normalized_action, normalized_action)
 
-        if action == "DECAY_REFRESH":
+        if normalized_action == "decay_refresh":
             # Refresh decay scores on all procedures
             try:
-                procedures = self.layers.procedural.get_all_procedures(limit=10000)
-                for proc in procedures:
-                    from synapse.layers.decay import compute_decay_score
-                    score = compute_decay_score(
-                        updated_at=proc.updated_at if hasattr(proc, 'updated_at') else None,
-                        access_count=proc.success_count,
-                        memory_layer=MemoryLayer.PROCEDURAL,
-                    )
-                    affected += 1
-                message = f"Refreshed decay scores for {affected} procedures"
+                if dry_run:
+                    procedures = self.layers.procedural.get_all_procedures(limit=10000)
+                    affected = len(procedures)
+                    message = f"Would refresh decay scores for {affected} procedures"
+                else:
+                    affected = self.layers.procedural.refresh_decay_scores()
+                    message = f"Refreshed decay scores for {affected} procedures"
             except Exception as e:
                 message = f"Decay refresh failed: {e}"
 
-        elif action == "PURGE_EXPIRED":
+        elif normalized_action == "purge_expired":
             if not dry_run:
                 try:
-                    affected = self.layers.episodic.purge_expired_episodes()
+                    purge_result = self.layers.purge_expired_episodes()
+                    affected = purge_result.get("deleted", 0) if isinstance(purge_result, dict) else int(purge_result)
                     message = f"Purged {affected} expired episodes"
                 except Exception as e:
                     message = f"Purge failed: {e}"
             else:
                 try:
-                    episodes = self.layers.episodic.get_all_episodes(limit=10000)
+                    episodes = self.layers.episodic.get_all_episodes(include_expired=True, limit=10000)
                     from datetime import datetime, timezone
                     now = datetime.now(timezone.utc)
                     for ep in episodes:
@@ -2542,7 +2817,7 @@ class SynapseService:
                 except Exception as e:
                     message = f"Purge check failed: {e}"
 
-        elif action == "VACUUM_SQLITE":
+        elif normalized_action == "vacuum_sqlite":
             if not dry_run:
                 try:
                     import sqlite3
@@ -2559,7 +2834,7 @@ class SynapseService:
             else:
                 message = "Would vacuum all SQLite databases"
 
-        elif action == "REBUILD_FTS":
+        elif normalized_action == "rebuild_fts":
             message = "FTS rebuild completed"
             affected = 0
 
@@ -2567,7 +2842,7 @@ class SynapseService:
             message = f"Unknown maintenance action: {action}"
 
         return {
-            "action": action,
+            "action": normalized_action,
             "affected": affected,
             "dry_run": dry_run,
             "message": message,

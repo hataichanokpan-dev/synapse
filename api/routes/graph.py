@@ -95,7 +95,7 @@ async def get_node(
 @router.get("/nodes/{node_id}/edges", response_model=EdgeListResponse)
 async def get_node_edges(
     node_id: str,
-    direction: str = Query("both", regex="^(in|out|both)$"),
+    direction: str = Query("both", pattern="^(in|out|both)$"),
     type: str = Query(None, description="Filter by edge type"),
     limit: int = Query(50, ge=1, le=200),
     service=Depends(get_synapse_service),
@@ -192,6 +192,8 @@ async def delete_node(
 ):
     """Delete a node and its edges."""
     result = await service.delete_node(node_id=node_id)
+    if result.get("available") is False:
+        raise HTTPException(status_code=503, detail=result.get("message", "Graph driver unavailable"))
 
     return SuccessResponse(
         status="ok",
@@ -206,6 +208,8 @@ async def delete_edge(
 ):
     """Delete an edge."""
     result = await service.delete_entity_edge(edge_id=edge_id)
+    if result.get("available") is False:
+        raise HTTPException(status_code=503, detail=result.get("message", "Graph driver unavailable"))
 
     return SuccessResponse(
         status="ok",

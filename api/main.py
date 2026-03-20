@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.config import settings
 from api.deps import init_services, shutdown_services
-from api.middleware import ErrorHandlerMiddleware
+from api.middleware import AuthMiddleware, ErrorHandlerMiddleware
 from api.routes import (
     identity_router,
     memory_router,
@@ -85,6 +85,7 @@ app.add_middleware(
 )
 
 # Error handler middleware
+app.add_middleware(AuthMiddleware)
 app.add_middleware(ErrorHandlerMiddleware)
 
 # Include routers

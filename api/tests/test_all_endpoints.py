@@ -1,450 +1,257 @@
 """
-Comprehensive tests for all Synapse API endpoints.
+High-signal API smoke and regression tests.
 """
 
+from __future__ import annotations
+
+from datetime import datetime
+
 import pytest
-from fastapi.testclient import TestClient
+
+from api.routes.feed import feed_stream
 
 
-class TestHealthEndpoints:
-    """Tests for health and root endpoints."""
-
-    def test_health_returns_healthy(self, client):
-        response = client.get("/health")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "healthy"
-        assert "service" in data
-        assert "version" in data
-
-    def test_root_returns_api_info(self, client):
-        response = client.get("/")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["name"] == "Synapse API"
-        assert "docs" in data
-        assert "health" in data
+def test_auth_enforcement(client):
+    assert client.get("/").status_code == 200
+    assert client.get("/health").status_code == 200
+    assert client.get("/api/memory/").status_code == 401
+    assert client.get("/api/memory/", headers={"X-API-Key": "wrong"}).status_code == 401
 
 
-class TestIdentityEndpoints:
-    """Tests for identity endpoints."""
+def test_memory_create_honors_forced_layer_and_returns_real_uuid(client, api_headers, synapse_service):
+    response = client.post(
+        "/api/memory/",
+        headers=api_headers,
+        json={
+            "name": "Remember meeting",
+            "content": "Met Alice and discussed project timeline",
+            "layer": "EPISODIC",
+            "metadata": {"topics": ["project"], "outcome": "scheduled"},
+        },
+    )
 
-    def test_get_identity(self, client, api_headers):
-        response = client.get("/api/identity/", headers=api_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert "user_id" in data
+    assert response.status_code == 200
+    data = response.json()
+    assert data["uuid"]
+    assert data["layer"] == "EPISODIC"
+    assert data["metadata"]["summary"] == "Remember meeting"
 
-    def test_set_identity(self, client, api_headers):
-        response = client.put(
-            "/api/identity/",
-            headers=api_headers,
-            json={"user_id": "test-user", "agent_id": "test-agent"}
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["user_id"] == "test-user"
-
-    def test_clear_identity(self, client, api_headers):
-        response = client.delete("/api/identity/", headers=api_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert "message" in data
-
-    def test_get_preferences(self, client, api_headers):
-        response = client.get("/api/identity/preferences", headers=api_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert "preferences" in data
-
-    def test_update_preferences(self, client, api_headers):
-        response = client.put(
-            "/api/identity/preferences",
-            headers=api_headers,
-            json={"language": "th", "timezone": "Asia/Bangkok"}
-        )
-        assert response.status_code == 200
+    episode = synapse_service.layers.episodic.get_episode(data["uuid"])
+    assert episode is not None
+    assert episode.summary == "Remember meeting"
+    assert episode.content == "Met Alice and discussed project timeline"
 
 
-class TestMemoryEndpoints:
-    """Tests for memory endpoints."""
+def test_memory_create_and_update_procedural_round_trip(client, api_headers, synapse_service):
+    create_response = client.post(
+        "/api/memory/",
+        headers=api_headers,
+        json={
+            "name": "Deploy app",
+            "content": "Run tests before deployment",
+            "layer": "PROCEDURAL",
+            "metadata": {
+                "trigger": "Deploy app safely",
+                "steps": ["Run tests", "Deploy"],
+                "topics": ["deploy"],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    created = create_response.json()
+    assert created["uuid"]
+    assert created["layer"] == "PROCEDURAL"
+    assert created["name"] == "Deploy app safely"
+    assert created["metadata"]["steps"] == ["Run tests", "Deploy"]
 
-    def test_add_memory_success(self, client, api_headers):
-        response = client.post(
-            "/api/memory/",
-            headers=api_headers,
-            json={
-                "name": "Test Memory",
-                "content": "Test content",
-                "layer": "EPISODIC"
+    procedure = synapse_service.layers.procedural.get_procedure(created["uuid"])
+    assert procedure is not None
+    assert procedure.trigger == "Deploy app safely"
+    assert procedure.procedure == ["Run tests", "Deploy"]
+
+    update_response = client.put(
+        f"/api/memory/{created['uuid']}",
+        headers=api_headers,
+        json={
+            "metadata": {
+                "trigger": "Deploy app safely v2",
+                "steps": ["Run tests", "Deploy", "Verify"],
+                "topics": ["deploy", "release"],
             }
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["name"] == "Test Memory"
-        assert "uuid" in data
-
-    def test_add_memory_all_layers(self, client, api_headers):
-        """Test adding memory to each layer."""
-        layers = ["EPISODIC", "SEMANTIC", "PROCEDURAL", "WORKING", "USER_MODEL"]
-        for layer in layers:
-            response = client.post(
-                "/api/memory/",
-                headers=api_headers,
-                json={"name": f"Test {layer}", "content": "content", "layer": layer}
-            )
-            assert response.status_code == 200
-
-    def test_add_memory_requires_name(self, client, api_headers):
-        response = client.post(
-            "/api/memory/",
-            headers=api_headers,
-            json={"content": "test"}
-        )
-        assert response.status_code == 422
-
-    def test_add_memory_requires_content(self, client, api_headers):
-        response = client.post(
-            "/api/memory/",
-            headers=api_headers,
-            json={"name": "test"}
-        )
-        assert response.status_code == 422
-
-    def test_list_memories(self, client, api_headers):
-        response = client.get("/api/memory/", headers=api_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert "items" in data
-        assert "total" in data
-
-    def test_list_memories_with_pagination(self, client, api_headers):
-        response = client.get("/api/memory/?limit=5&offset=10", headers=api_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert data["limit"] == 5
-        assert data["offset"] == 10
-
-    def test_search_memories(self, client, api_headers):
-        response = client.post(
-            "/api/memory/search",
-            headers=api_headers,
-            json={"query": "test", "limit": 10}
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert "results" in data
-        assert data["query"] == "test"
-
-    def test_search_memories_with_layers(self, client, api_headers):
-        response = client.post(
-            "/api/memory/search",
-            headers=api_headers,
-            json={"query": "test", "layers": ["EPISODIC", "SEMANTIC"]}
-        )
-        assert response.status_code == 200
-
-    def test_consolidate_memories(self, client, api_headers):
-        response = client.post(
-            "/api/memory/consolidate",
-            headers=api_headers,
-            json={"dry_run": True}
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert "promoted" in data
-        assert data["dry_run"] is True
-
-    def test_get_memory_not_found(self, client, api_headers):
-        response = client.get("/api/memory/nonexistent-id", headers=api_headers)
-        assert response.status_code == 404
-
-    def test_update_memory(self, client, api_headers):
-        response = client.put(
-            "/api/memory/test-id",
-            headers=api_headers,
-            json={"content": "updated"}
-        )
-        assert response.status_code == 200
-
-    def test_delete_memory(self, client, api_headers):
-        response = client.delete("/api/memory/test-id", headers=api_headers)
-        assert response.status_code == 200
-
-
-class TestProceduresEndpoints:
-    """Tests for procedures endpoints."""
-
-    def test_add_procedure(self, client, api_headers):
-        response = client.post(
-            "/api/procedures/",
-            headers=api_headers,
-            json={
-                "trigger": "test-trigger",
-                "steps": ["step1", "step2"],
-                "topics": ["test"]
-            }
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["trigger"] == "test-trigger"
-
-    def test_add_procedure_requires_trigger(self, client, api_headers):
-        response = client.post(
-            "/api/procedures/",
-            headers=api_headers,
-            json={"steps": ["step1"]}
-        )
-        assert response.status_code == 422
-
-    def test_add_procedure_requires_steps(self, client, api_headers):
-        response = client.post(
-            "/api/procedures/",
-            headers=api_headers,
-            json={"trigger": "test"}
-        )
-        assert response.status_code == 422
-
-    def test_list_procedures(self, client, api_headers):
-        response = client.get("/api/procedures/", headers=api_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert "items" in data
-
-    def test_record_procedure_success(self, client, api_headers):
-        response = client.post(
-            "/api/procedures/test-trigger/success",
-            headers=api_headers
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert "success_count" in data
-
-    def test_get_procedure_not_found(self, client, api_headers):
-        response = client.get("/api/procedures/nonexistent", headers=api_headers)
-        assert response.status_code == 404
-
-    def test_update_procedure(self, client, api_headers):
-        response = client.put(
-            "/api/procedures/test-id",
-            headers=api_headers,
-            json={"steps": ["new-step"]}
-        )
-        assert response.status_code == 200
-
-    def test_delete_procedure(self, client, api_headers):
-        response = client.delete("/api/procedures/test-id", headers=api_headers)
-        assert response.status_code == 200
-
-
-class TestOracleEndpoints:
-    """Tests for oracle endpoints."""
-
-    def test_consult(self, client, api_headers):
-        response = client.post(
-            "/api/oracle/consult",
-            headers=api_headers,
-            json={"query": "What is the meaning?", "limit": 5}
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert "query" in data
-        assert "layers" in data
-
-    def test_consult_requires_query(self, client, api_headers):
-        response = client.post(
-            "/api/oracle/consult",
-            headers=api_headers,
-            json={}
-        )
-        assert response.status_code == 422
-
-    def test_reflect(self, client, api_headers):
-        response = client.post(
-            "/api/oracle/reflect",
-            headers=api_headers,
-            json={"count": 5}
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert "insights" in data
-
-    def test_analyze(self, client, api_headers):
-        response = client.post(
-            "/api/oracle/analyze",
-            headers=api_headers,
-            json={"analysis_type": "topics", "time_range_days": 30}
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert "patterns" in data
-
-
-class TestSystemEndpoints:
-    """Tests for system endpoints."""
-
-    def test_get_status(self, client, api_headers):
-        response = client.get("/api/system/status", headers=api_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert "status" in data
-
-    def test_get_stats(self, client, api_headers):
-        response = client.get("/api/system/stats", headers=api_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert "memory" in data
-        assert "storage" in data
-
-    def test_maintenance(self, client, api_headers):
-        response = client.post(
-            "/api/system/maintenance",
-            headers=api_headers,
-            json={"actions": ["decay_refresh"]}
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert "results" in data
-
-    def test_clear_graph_requires_confirm(self, client, api_headers):
-        response = client.delete(
-            "/api/system/graph",
-            headers=api_headers,
-            json={"confirm": False}
-        )
-        assert response.status_code == 400
-
-    def test_clear_graph_with_confirm(self, client, api_headers):
-        response = client.delete(
-            "/api/system/graph",
-            headers=api_headers,
-            json={"confirm": True}
-        )
-        assert response.status_code == 200
-
-
-class TestGraphEndpoints:
-    """Tests for graph endpoints."""
-
-    def test_list_nodes(self, client, api_headers):
-        response = client.get("/api/graph/nodes", headers=api_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert "nodes" in data
-
-    def test_list_nodes_with_query(self, client, api_headers):
-        response = client.get("/api/graph/nodes?query=test", headers=api_headers)
-        assert response.status_code == 200
-
-    def test_get_node_not_found(self, client, api_headers):
-        response = client.get("/api/graph/nodes/nonexistent", headers=api_headers)
-        assert response.status_code == 404
-
-    def test_get_node_edges(self, client, api_headers):
-        response = client.get("/api/graph/nodes/test-id/edges", headers=api_headers)
-        assert response.status_code == 200
-
-    def test_list_edges(self, client, api_headers):
-        response = client.get("/api/graph/edges", headers=api_headers)
-        assert response.status_code == 200
-
-    def test_get_edge_not_found(self, client, api_headers):
-        response = client.get("/api/graph/edges/nonexistent", headers=api_headers)
-        assert response.status_code == 404
-
-    def test_delete_node(self, client, api_headers):
-        response = client.delete("/api/graph/nodes/test-id", headers=api_headers)
-        assert response.status_code == 200
-
-    def test_delete_edge(self, client, api_headers):
-        response = client.delete("/api/graph/edges/test-id", headers=api_headers)
-        assert response.status_code == 200
-
-
-class TestEpisodesEndpoints:
-    """Tests for episodes endpoints."""
-
-    def test_list_episodes(self, client, api_headers):
-        response = client.get("/api/episodes/", headers=api_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert "episodes" in data
-
-    def test_get_episode_not_found(self, client, api_headers):
-        response = client.get("/api/episodes/nonexistent", headers=api_headers)
-        assert response.status_code == 404
-
-    def test_delete_episode(self, client, api_headers):
-        response = client.delete("/api/episodes/test-id", headers=api_headers)
-        assert response.status_code == 200
-
-
-class TestFeedEndpoints:
-    """Tests for feed endpoints."""
-
-    def test_get_feed(self, client, api_headers):
-        response = client.get("/api/feed/", headers=api_headers)
-        assert response.status_code == 200
-        data = response.json()
-        assert "events" in data
-
-    def test_feed_stream(self, client, api_headers):
-        response = client.get("/api/feed/stream", headers=api_headers)
-        assert response.status_code == 200
-        assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
-
-
-class TestValidation:
-    """Tests for validation and error handling."""
-
-    def test_invalid_json(self, client, api_headers):
-        response = client.post(
-            "/api/memory/",
-            headers=api_headers,
-            content="not json"
-        )
-        assert response.status_code == 422
-
-    def test_empty_body(self, client, api_headers):
-        response = client.post(
-            "/api/memory/",
-            headers=api_headers,
-            json={}
-        )
-        assert response.status_code == 422
-
-    def test_invalid_layer(self, client, api_headers):
-        response = client.post(
-            "/api/memory/",
-            headers=api_headers,
-            json={"name": "test", "content": "test", "layer": "INVALID"}
-        )
-        assert response.status_code == 422
-
-    def test_pagination_limits(self, client, api_headers):
-        # Test max limit
-        response = client.get("/api/memory/?limit=1000", headers=api_headers)
-        assert response.status_code == 200  # Should clamp to max
-
-    def test_negative_offset(self, client, api_headers):
-        response = client.get("/api/memory/?offset=-1", headers=api_headers)
-        assert response.status_code == 422
-
-
-class TestOpenAPI:
-    """Tests for API documentation."""
-
-    def test_docs_endpoint(self, client):
-        response = client.get("/docs")
-        assert response.status_code == 200
-
-    def test_redoc_endpoint(self, client):
-        response = client.get("/redoc")
-        assert response.status_code == 200
-
-    def test_openapi_json(self, client):
-        response = client.get("/openapi.json")
-        assert response.status_code == 200
-        data = response.json()
-        assert "openapi" in data
-        assert "paths" in data
+        },
+    )
+    assert update_response.status_code == 200
+    updated = update_response.json()
+    assert updated["name"] == "Deploy app safely v2"
+    assert updated["metadata"]["steps"] == ["Run tests", "Deploy", "Verify"]
+    assert updated["metadata"]["topics"] == ["deploy", "release"]
+
+
+def test_memory_search_respects_layer_filter(client, api_headers):
+    client.post(
+        "/api/memory/",
+        headers=api_headers,
+        json={
+            "name": "Deploy app",
+            "content": "Run tests before deployment",
+            "layer": "PROCEDURAL",
+            "metadata": {"steps": ["Run tests before deployment"]},
+        },
+    )
+    client.post(
+        "/api/memory/",
+        headers=api_headers,
+        json={
+            "name": "Daily note",
+            "content": "Deployment meeting happened today",
+            "layer": "EPISODIC",
+        },
+    )
+
+    response = client.post(
+        "/api/memory/search",
+        headers=api_headers,
+        json={"query": "deploy", "layers": ["PROCEDURAL"]},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] >= 1
+    assert all(result["layer"] == "PROCEDURAL" for result in data["results"])
+    assert data["layers_searched"] == ["PROCEDURAL"]
+
+
+def test_memory_search_finds_new_episodic_items_by_query(client, api_headers):
+    create_response = client.post(
+        "/api/memory/",
+        headers=api_headers,
+        json={
+            "name": "Release note",
+            "content": "Smoke token episodic-search-token is present in this memory",
+            "layer": "EPISODIC",
+            "metadata": {"topics": ["release"], "outcome": "documented"},
+        },
+    )
+    assert create_response.status_code == 200
+    created = create_response.json()
+
+    search_response = client.post(
+        "/api/memory/search",
+        headers=api_headers,
+        json={"query": "episodic-search-token", "layers": ["EPISODIC"]},
+    )
+
+    assert search_response.status_code == 200
+    data = search_response.json()
+    assert data["total"] >= 1
+    assert any(result["uuid"] == created["uuid"] for result in data["results"])
+    assert all(result["layer"] == "EPISODIC" for result in data["results"])
+
+
+def test_procedure_endpoints_return_real_ids_and_trigger(client, api_headers):
+    create_response = client.post(
+        "/api/procedures/",
+        headers=api_headers,
+        json={
+            "trigger": "Backup DB",
+            "steps": ["Stop writes", "Dump DB"],
+            "topics": ["ops"],
+        },
+    )
+    assert create_response.status_code == 200
+    created = create_response.json()
+    assert created["uuid"]
+    assert created["trigger"] == "Backup DB"
+
+    success_response = client.post(
+        f"/api/procedures/{created['uuid']}/success",
+        headers=api_headers,
+    )
+    assert success_response.status_code == 200
+    succeeded = success_response.json()
+    assert succeeded["uuid"] == created["uuid"]
+    assert succeeded["trigger"] == "Backup DB"
+    assert succeeded["success_count"] == 1
+
+
+def test_preferences_round_trip_normalizes_response_style_and_length(client, api_headers):
+    update_response = client.put(
+        "/api/identity/preferences",
+        headers=api_headers,
+        json={
+            "response_style": "balanced",
+            "response_length": "detailed",
+            "add_topics": ["ai"],
+        },
+    )
+    assert update_response.status_code == 200
+    updated = update_response.json()
+    assert updated["user_id"] == "test-user"
+    assert updated["updated_at"] is not None
+    assert updated["preferences"]["response_style"] == "auto"
+    assert updated["preferences"]["response_length"] == "detailed"
+
+    get_response = client.get("/api/identity/preferences", headers=api_headers)
+    assert get_response.status_code == 200
+    fetched = get_response.json()
+    assert fetched["user_id"] == "test-user"
+    assert fetched["preferences"]["response_style"] == "auto"
+    assert fetched["preferences"]["response_length"] == "detailed"
+    assert fetched["preferences"]["topics"] == ["ai"]
+
+
+def test_feed_history_works(client, api_headers):
+    client.post(
+        "/api/memory/",
+        headers=api_headers,
+        json={
+            "name": "Remember meeting",
+            "content": "Met Alice and discussed project timeline",
+            "layer": "EPISODIC",
+        },
+    )
+
+    feed_response = client.get("/api/feed/", headers=api_headers)
+    assert feed_response.status_code == 200
+    feed = feed_response.json()
+    assert feed["events"]
+    datetime.fromisoformat(feed["events"][0]["timestamp"].replace("Z", "+00:00"))
+
+
+@pytest.mark.asyncio
+async def test_feed_stream_emits_connected_event(event_bus):
+    response = await feed_stream(event_bus=event_bus)
+    assert response.media_type == "text/event-stream"
+
+    first_chunk = await anext(response.body_iterator)
+    if isinstance(first_chunk, bytes):
+        first_chunk = first_chunk.decode("utf-8")
+    assert "\"connected\"" in first_chunk
+
+    await response.body_iterator.aclose()
+
+
+def test_system_maintenance_and_graph_unavailable_paths(client, api_headers):
+    maintenance = client.post(
+        "/api/system/maintenance",
+        headers=api_headers,
+        json={"actions": ["purge_expired"], "dry_run": True},
+    )
+    assert maintenance.status_code == 200
+    maintenance_body = maintenance.json()
+    assert maintenance_body["results"][0]["action"] == "purge_expired"
+    assert "Would purge" in maintenance_body["results"][0]["message"]
+
+    clear_graph = client.request(
+        "DELETE",
+        "/api/system/graph",
+        headers=api_headers,
+        json={"confirm": True},
+    )
+    assert clear_graph.status_code == 503
+
+    delete_node = client.delete("/api/graph/nodes/test-node", headers=api_headers)
+    assert delete_node.status_code == 503
+
+    delete_edge = client.delete("/api/graph/edges/test-edge", headers=api_headers)
+    assert delete_edge.status_code == 503

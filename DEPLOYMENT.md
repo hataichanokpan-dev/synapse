@@ -1,8 +1,19 @@
 # Synapse Production Deployment Guide
 
 > **Version**: 1.0.0
-> **Date**: 2026-03-17
-> **QA Score**: 98/100 (A+)
+> **Date**: 2026-03-20
+> **Status**: Setup guide only. Use the current release gate below for go/no-go decisions.
+
+---
+
+## Current Release Gate
+
+The canonical production gate is:
+
+- [docs/checklists/production_release_checklist_2026-03-20.md](docs/checklists/production_release_checklist_2026-03-20.md)
+- `python scripts/pre_deploy_smoke.py --base-url <url> --api-key <key> --output-json artifacts/pre_deploy_smoke.json`
+
+Do not rely on historical QA scores in this file as a release decision.
 
 ---
 

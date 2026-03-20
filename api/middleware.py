@@ -14,10 +14,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
     """API Key authentication middleware."""
 
     EXEMPT_PATHS = {"/health", "/docs", "/redoc", "/openapi.json", "/"}
+    EXEMPT_PREFIXES = ("/docs", "/redoc")
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if any(path.startswith(exempt) for exempt in self.EXEMPT_PATHS):
+        if path in self.EXEMPT_PATHS or any(path.startswith(prefix) for prefix in self.EXEMPT_PREFIXES):
             return await call_next(request)
 
         api_key = request.headers.get(settings.api_key_header)

@@ -6,11 +6,11 @@ Provides in-memory event publishing and SSE streaming for the feed system.
 
 import asyncio
 from collections import deque
-from datetime import datetime
-from typing import Any, Dict, List, Optional
 from enum import Enum
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class FeedEventType(str, Enum):
@@ -35,7 +35,7 @@ class FeedEvent(BaseModel):
     type: FeedEventType
     layer: Optional[str] = None
     summary: str
-    detail: Dict[str, Any] = {}
+    detail: Dict[str, Any] = Field(default_factory=dict)
     timestamp: datetime
 
     class Config:
@@ -80,7 +80,7 @@ class EventBus:
                 layer=layer,
                 summary=summary,
                 detail=detail or {},
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
             )
 
             # Add to ring buffer
@@ -124,7 +124,13 @@ class EventBus:
             layer: Filter by layer
             since: Only events after this timestamp
         """
+        def _coerce_utc(value: Optional[datetime]) -> Optional[datetime]:
+            if value is None:
+                return None
+            return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
         events = list(self._ring_buffer)
+        since = _coerce_utc(since)
 
         # Filter by layer
         if layer:
@@ -132,10 +138,10 @@ class EventBus:
 
         # Filter by timestamp
         if since:
-            events = [e for e in events if e.timestamp > since]
+            events = [e for e in events if _coerce_utc(e.timestamp) and _coerce_utc(e.timestamp) > since]
 
         # Sort by timestamp (newest first) and limit
-        events.sort(key=lambda e: e.timestamp, reverse=True)
+        events.sort(key=lambda e: _coerce_utc(e.timestamp) or datetime.now(timezone.utc), reverse=True)
         return events[:limit]
 
     @property

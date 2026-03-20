@@ -191,16 +191,3 @@ async def shutdown_services():
     _event_bus = None
     _graphiti_client = None
     print("[OK] Services shut down")
-
-    async def clear_graph(self, confirm=False, group_ids=None):
-        return {"status": "ok", "message": "Mock clear"}
-
-    # Oracle methods (async)
-    async def consult(self, query, **kwargs):
-        return {"query": query, "layers": {}, "summary": [], "suggestions": []}
-
-    async def reflect(self, layer=None):
-        return {"insights": [], "source_layer": layer or "all"}
-
-    async def analyze_patterns(self, **kwargs):
-        return {"patterns": {}}

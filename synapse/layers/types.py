@@ -28,6 +28,21 @@ class MemoryLayer(str, Enum):
     EPISODIC = "episodic"
     WORKING = "working"
 
+    @classmethod
+    def _missing_(cls, value):
+        if value is None:
+            return None
+        normalized = str(value).strip().lower().replace("-", "_")
+        aliases = {
+            "user": cls.USER_MODEL,
+            "user_model": cls.USER_MODEL,
+            "procedural": cls.PROCEDURAL,
+            "semantic": cls.SEMANTIC,
+            "episodic": cls.EPISODIC,
+            "working": cls.WORKING,
+        }
+        return aliases.get(normalized)
+
 
 class DecayConfig:
     """
@@ -194,6 +209,7 @@ class SynapseEpisode(BaseModel):
     # Timestamps
     recorded_at: datetime = Field(default_factory=utcnow)
     expires_at: Optional[datetime] = Field(None, description="TTL expiration")
+    access_count: int = Field(0, ge=0, description="Access count")
 
     # Identity hierarchy: user → agent → chat → session
     user_id: Optional[str] = Field(None, description="User identifier")
@@ -269,6 +285,9 @@ class ProceduralMemory(BaseModel):
 
     # Topics
     topics: List[str] = Field(default_factory=list)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    decay_score: float = Field(1.0, ge=0.0, le=1.0)
 
 
 class SearchResult(BaseModel):

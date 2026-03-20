@@ -15,10 +15,12 @@ This layer wraps Graphiti's functionality with:
 - Thai NLP preprocessing for better extraction
 """
 
-import logging
 import os
+import logging
+import re
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+from uuid import uuid4
 
 from synapse.storage import QdrantClient
 from synapse.graphiti.errors import (
@@ -59,6 +61,15 @@ def _get_nlp_preprocessor():
         except ImportError:
             _nlp_preprocessor = False  # Mark as unavailable
     return _nlp_preprocessor if _nlp_preprocessor else None
+
+
+def _sanitize_graph_group_id(group_id: Optional[str]) -> str:
+    """Sanitize group IDs for Graphiti/FalkorDB compatibility."""
+    if group_id is None:
+        return "semantic"
+    sanitized = re.sub(r"[^A-Za-z0-9_]+", "_", str(group_id).strip())
+    sanitized = sanitized.strip("_")
+    return sanitized or "semantic"
 
 
 class SemanticManager:
@@ -155,7 +166,30 @@ class SemanticManager:
         logger.warning("Semantic memory Qdrant integration unavailable: %s", exc)
         self._vector_warning_emitted = True
 
-    def _index_entity(self, node: SynapseNode) -> None:
+    async def _persist_graphiti_episode(
+        self,
+        *,
+        name: str,
+        episode_body: str,
+        source_description: str,
+        reference_time: Optional[datetime] = None,
+        group_id: Optional[str] = None,
+    ) -> None:
+        """Persist a semantic-side event to Graphiti with required arguments."""
+        if self._graphiti is None:
+            if _REQUIRE_GRAPHITI:
+                raise GraphitiNotInitializedError("semantic_graph_persist")
+            return
+
+        await self._graphiti.add_episode(
+            name=name,
+            episode_body=episode_body,
+            source_description=source_description,
+            reference_time=reference_time or utcnow(),
+            group_id=_sanitize_graph_group_id(group_id),
+        )
+
+    def _index_entity(self, node: SynapseNode) -> bool:
         """Store entity text and metadata in Qdrant."""
         try:
             self.vector_client.upsert(
@@ -182,8 +216,10 @@ class SemanticManager:
                     }
                 ],
             )
+            return True
         except Exception as exc:
             self._warn_vector_issue(exc)
+            return False
 
     def _payload_to_node(self, payload: Dict[str, Any]) -> Optional[SynapseNode]:
         """Convert a Qdrant payload into a SynapseNode."""
@@ -265,7 +301,7 @@ class SemanticManager:
                     summary_result = preprocessor.preprocess_for_extraction(summary)
                     processed_summary = summary_result.processed
 
-        node_id = f"entity_{processed_name.lower().replace(' ', '_')}_{int(now.timestamp())}"
+        node_id = str(uuid4())
 
         node = SynapseNode(
             id=node_id,
@@ -282,23 +318,31 @@ class SemanticManager:
         )
 
         # Index to Qdrant (existing)
-        self._index_entity(node)
+        qdrant_persisted = self._index_entity(node)
 
         # Persist to Graphiti/FalkorDB
+        graph_persisted = False
         if self._graphiti is not None:
             try:
                 # Use add_episode to let LLM extract entity
                 episode_content = f"{processed_name}: {processed_summary or ''}"
-                await self._graphiti.add_episode(
+                await self._persist_graphiti_episode(
                     name=f"entity_{processed_name}",
                     episode_body=episode_content,
                     source_description=f"Entity type: {entity_type.value}",
+                    reference_time=now,
                 )
                 logger.debug(f"Entity '{processed_name}' persisted to Graphiti")
+                graph_persisted = True
             except Exception as e:
                 self._handle_graphiti_error("add_entity", e, processed_name)
         elif _REQUIRE_GRAPHITI:
             raise GraphitiNotInitializedError("add_entity")
+
+        if not qdrant_persisted and not graph_persisted:
+            raise RuntimeError(
+                "Semantic memory persistence failed: no durable backend accepted the write"
+            )
 
         return node
 
@@ -351,10 +395,11 @@ class SemanticManager:
                 episode_content = f"{source_id} {relation_type.value} {target_id}"
                 if metadata:
                     episode_content += f" | {metadata}"
-                await self._graphiti.add_episode(
+                await self._persist_graphiti_episode(
                     name=f"fact_{edge_id}",
                     episode_body=episode_content,
                     source_description=f"Fact: {relation_type.value}",
+                    reference_time=now,
                 )
                 logger.debug(f"Fact '{edge_id}' persisted to Graphiti")
             except Exception as e:
@@ -520,10 +565,11 @@ class SemanticManager:
             try:
                 # Add an episode marking the old fact as invalid
                 invalidation_content = f"Fact {old_edge_id} is no longer valid as of {now.isoformat()}"
-                await self._graphiti.add_episode(
+                await self._persist_graphiti_episode(
                     name=f"invalidate_{old_edge_id}",
                     episode_body=invalidation_content,
                     source_description="Fact invalidation",
+                    reference_time=now,
                 )
                 logger.debug(f"Fact '{old_edge_id}' marked as invalid in Graphiti")
             except Exception as e:
@@ -539,10 +585,11 @@ class SemanticManager:
         if self._graphiti is not None:
             try:
                 episode_content = f"{new_edge.source_id} {new_edge.type.value} {new_edge.target_id}"
-                await self._graphiti.add_episode(
+                await self._persist_graphiti_episode(
                     name=f"fact_{new_edge.id}",
                     episode_body=episode_content,
                     source_description=f"Superseding fact: {new_edge.type.value}",
+                    reference_time=now,
                 )
                 logger.debug(f"New fact '{new_edge.id}' persisted to Graphiti")
             except Exception as e:
@@ -594,10 +641,11 @@ class SemanticManager:
         if self._graphiti is not None:
             try:
                 episode_content = f"Updated {node.name}: {summary or ''}"
-                await self._graphiti.add_episode(
+                await self._persist_graphiti_episode(
                     name=f"update_{entity_id}",
                     episode_body=episode_content,
                     source_description=f"Entity update: {node.type.value}",
+                    reference_time=node.updated_at,
                 )
                 logger.debug(f"Entity '{entity_id}' update persisted to Graphiti")
             except Exception as e:

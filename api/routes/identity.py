@@ -20,9 +20,43 @@ from api.models import (
     UpdatePreferencesRequest,
     PreferencesResponse,
     ResponseStyle,
+    ResponseLength,
 )
 
 router = APIRouter(tags=["Identity"])
+
+
+def _build_preferences_response(result: dict, user_id: str | None = None) -> PreferencesResponse:
+    """Normalize service user-context output into canonical API preferences."""
+    expertise_raw = result.get("expertise", [])
+    expertise = list(expertise_raw.keys()) if isinstance(expertise_raw, dict) else list(expertise_raw or [])
+    notes_raw = result.get("notes", "")
+    notes = ", ".join(notes_raw) if isinstance(notes_raw, list) else str(notes_raw or "")
+
+    try:
+        style = ResponseStyle(result.get("response_style", "auto"))
+    except ValueError:
+        style = ResponseStyle.AUTO
+    try:
+        length = ResponseLength(result.get("response_length", "auto"))
+    except ValueError:
+        length = ResponseLength.AUTO
+
+    prefs = UserPreferences(
+        language=result.get("language", "en"),
+        timezone=result.get("timezone", "UTC"),
+        response_style=style,
+        response_length=length,
+        expertise=expertise,
+        topics=result.get("common_topics", []),
+        notes=notes,
+        custom={},
+    )
+    return PreferencesResponse(
+        user_id=result.get("user_id", user_id),
+        preferences=prefs,
+        updated_at=result.get("updated_at"),
+    )
 
 
 @router.get("/", response_model=IdentityResponse)
@@ -71,34 +105,7 @@ async def get_preferences(
 ):
     """Get user preferences (Layer 1 - User Model)."""
     result = service.get_user_context()
-
-    # Normalize types: service may return dict for expertise, list for notes
-    expertise_raw = result.get("expertise", [])
-    expertise = list(expertise_raw.keys()) if isinstance(expertise_raw, dict) else list(expertise_raw)
-    notes_raw = result.get("notes", "")
-    notes = ", ".join(notes_raw) if isinstance(notes_raw, list) else str(notes_raw)
-
-    # Normalize response_style: service may return values not in ResponseStyle enum
-    style = result.get("response_style", "balanced")
-    try:
-        style = ResponseStyle(style)
-    except ValueError:
-        style = ResponseStyle.BALANCED
-
-    prefs = UserPreferences(
-        language=result.get("language", "en"),
-        timezone=result.get("timezone", "UTC"),
-        response_style=style,
-        expertise=expertise,
-        topics=result.get("common_topics", []),
-        notes=notes,
-        custom={},
-    )
-    return PreferencesResponse(
-        user_id=result.get("user_id", user_id),
-        preferences=prefs,
-        updated_at=result.get("updated_at"),
-    )
+    return _build_preferences_response(result, user_id=user_id)
 
 
 @router.put("/preferences", response_model=PreferencesResponse)
@@ -111,31 +118,12 @@ async def update_preferences(
     result = service.update_user_preferences(
         language=request.language,
         timezone=request.timezone,
-        response_style=request.response_style,
+        response_style=request.response_style.value if request.response_style else None,
+        response_length=request.response_length.value if request.response_length else None,
         add_expertise=request.add_expertise,
         remove_expertise=request.remove_expertise,
         add_topics=request.add_topics,
         remove_topics=request.remove_topics,
         notes=request.notes,
     )
-
-    expertise_raw = result.get("expertise", [])
-    expertise = list(expertise_raw.keys()) if isinstance(expertise_raw, dict) else list(expertise_raw)
-    notes_raw = result.get("notes", "")
-    notes = ", ".join(notes_raw) if isinstance(notes_raw, list) else str(notes_raw)
-    style = result.get("response_style", "balanced")
-    try:
-        style = ResponseStyle(style)
-    except ValueError:
-        style = ResponseStyle.BALANCED
-
-    prefs = UserPreferences(
-        language=result.get("language", "en"),
-        timezone=result.get("timezone", "UTC"),
-        response_style=style,
-        expertise=expertise,
-        topics=result.get("common_topics", []),
-        notes=notes,
-        custom={},
-    )
-    return PreferencesResponse(preferences=prefs)
+    return _build_preferences_response(result)

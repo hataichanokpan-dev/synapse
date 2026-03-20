@@ -30,6 +30,18 @@ from api.models import (
 router = APIRouter(tags=["System"])
 
 
+def _map_component_status(status: str) -> ServiceStatus:
+    """Map raw component health strings into API status values."""
+    normalized = str(status).strip().lower()
+    if normalized == "ok":
+        return ServiceStatus.HEALTHY
+    if "not initialized" in normalized or "degraded" in normalized:
+        return ServiceStatus.DEGRADED
+    if normalized.startswith("error"):
+        return ServiceStatus.UNHEALTHY
+    return ServiceStatus.DEGRADED
+
+
 @router.get("/status", response_model=StatusResponse)
 async def get_status(service=Depends(get_synapse_service)):
     """Get system status."""
@@ -41,7 +53,7 @@ async def get_status(service=Depends(get_synapse_service)):
         for name, status in result["components"].items():
             components.append(ComponentHealth(
                 name=name,
-                status=ServiceStatus.HEALTHY if status == "ok" else ServiceStatus.UNHEALTHY,
+                status=_map_component_status(status),
                 message=status,
             ))
     else:
@@ -52,7 +64,13 @@ async def get_status(service=Depends(get_synapse_service)):
         ))
 
     return StatusResponse(
-        status=ServiceStatus.HEALTHY if result.get("status") == "ok" else ServiceStatus.DEGRADED,
+        status=(
+            ServiceStatus.HEALTHY
+            if result.get("status") == "ok"
+            else ServiceStatus.DEGRADED
+            if result.get("status") == "degraded"
+            else ServiceStatus.UNHEALTHY
+        ),
         message=result.get("message", ""),
         components=components,
     )
@@ -74,6 +92,8 @@ async def clear_graph(
         confirm=True,
         group_ids=request.group_ids,
     )
+    if result.get("available") is False:
+        raise HTTPException(status_code=503, detail=result.get("message", "Graph driver unavailable"))
 
     return ClearGraphResponse(
         status="ok",

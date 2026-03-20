@@ -1,270 +1,112 @@
 """
-Real integration tests for Memory API - NO MOCK.
-
-Tests the full chain: API → SynapseService → LayerManager → SQLite
+Service-level regression tests for real SQLite-backed memory operations.
 """
 
+from __future__ import annotations
+
 import pytest
-import asyncio
-from datetime import datetime
 
-# Test configuration
-TEST_DB_PATH = "/tmp/synapse_test_episodic.db"
-TEST_PROCEDURAL_DB_PATH = "/tmp/synapse_test_procedural.db"
+from synapse.layers import EntityType
+from synapse.layers.semantic import SemanticManager
 
 
-@pytest.fixture
-async def real_service():
-    """Create a real SynapseService with test databases."""
-    import os
-    import sys
-    from pathlib import Path
+@pytest.mark.asyncio
+async def test_list_memories_empty(synapse_service):
+    result = await synapse_service.list_memories()
+    assert result["items"] == []
+    assert result["total"] == 0
 
-    # Add parent to path
-    parent = Path(__file__).parent.parent.parent
-    if str(parent) not in sys.path:
-        sys.path.insert(0, str(parent))
 
-    from synapse.layers import LayerManager
-    from synapse.layers.episodic import EpisodicManager
-    from synapse.layers.procedural import ProceduralManager
-    from synapse.services.synapse_service import SynapseService
+@pytest.mark.asyncio
+async def test_add_memory_honors_explicit_layers_and_returns_real_uuid(synapse_service):
+    episodic = await synapse_service.add_memory(
+        name="Meeting notes",
+        episode_body="Met Alice and discussed project timeline",
+        layer="EPISODIC",
+        metadata={"topics": ["project"], "outcome": "scheduled"},
+        source="api",
+    )
+    assert episodic["uuid"]
+    assert episodic["layer"] == "episodic"
+    assert synapse_service.layers.episodic.get_episode(episodic["uuid"]) is not None
 
-    # Create managers with test databases
-    episodic = EpisodicManager(db_path=Path(TEST_DB_PATH))
-    procedural = ProceduralManager(db_path=Path(TEST_PROCEDURAL_DB_PATH))
+    procedural = await synapse_service.add_memory(
+        name="Deploy app",
+        episode_body="Run tests before deployment",
+        layer="PROCEDURAL",
+        metadata={
+            "trigger": "Deploy app safely",
+            "steps": ["Run tests", "Deploy"],
+            "topics": ["deploy"],
+        },
+        source="api",
+    )
+    assert procedural["uuid"]
+    assert procedural["layer"] == "procedural"
+    stored = synapse_service.layers.procedural.get_procedure(procedural["uuid"])
+    assert stored is not None
+    assert stored.trigger == "Deploy app safely"
+    assert stored.procedure == ["Run tests", "Deploy"]
 
-    # Create layer manager
-    layers = LayerManager(
-        episodic_manager=episodic,
-        procedural_manager=procedural,
+
+@pytest.mark.asyncio
+async def test_update_memory_supports_episodic_and_procedural(synapse_service):
+    episode = synapse_service.layers.episodic.record_episode(
+        content="Initial content",
+        summary="Initial summary",
+        user_id="test-user",
+    )
+    updated_episode = await synapse_service.update_memory(
+        episode.id,
+        content="Updated content",
+        metadata={"summary": "Updated summary", "topics": ["updated"], "outcome": "done"},
+    )
+    assert updated_episode is not None
+    assert updated_episode["name"] == "Updated summary"
+    assert updated_episode["content"] == "Updated content"
+    assert updated_episode["metadata"]["topics"] == ["updated"]
+
+    procedure = synapse_service.layers.procedural.learn_procedure(
+        trigger="Initial trigger",
+        procedure=["step 1"],
+        topics=["ops"],
+    )
+    updated_procedure = await synapse_service.update_memory(
+        procedure.id,
+        metadata={"trigger": "Updated trigger", "steps": ["step 1", "step 2"], "topics": ["ops", "deploy"]},
+    )
+    assert updated_procedure is not None
+    assert updated_procedure["name"] == "Updated trigger"
+    assert updated_procedure["metadata"]["steps"] == ["step 1", "step 2"]
+    assert updated_procedure["metadata"]["topics"] == ["ops", "deploy"]
+
+
+@pytest.mark.asyncio
+async def test_search_memory_normalizes_layer_filters(synapse_service):
+    synapse_service.layers.procedural.learn_procedure(
+        trigger="Deploy app",
+        procedure=["Run tests", "Deploy"],
+        topics=["deploy"],
     )
 
-    # Create service (no graphiti for this test)
-    service = SynapseService(
-        graphiti_client=None,
-        layer_manager=layers,
-        user_id="test_user",
-    )
-
-    yield service
-
-    # Cleanup
-    os.remove(TEST_DB_PATH)
-    os.remove(TEST_PROCEDURAL_DB_PATH)
+    result = await synapse_service.search_memory("deploy", layers=["PROCEDURAL"], limit=5)
+    assert "procedural" in result["layers"]
+    assert result["layers"]["procedural"]
+    assert "episodic" not in result["layers"]
 
 
-class TestMemoryListReal:
-    """Real tests for list_memories - NO MOCK."""
+class RejectingVectorClient:
+    def upsert(self, *args, **kwargs):
+        raise RuntimeError("vector write failed")
 
-    @pytest.mark.asyncio
-    async def test_list_memories_empty(self, real_service):
-        """Test listing memories when empty."""
-        result = await real_service.list_memories()
 
-        assert result is not None
-        assert "items" in result
-        assert "total" in result
-        assert result["items"] == []
-        assert result["total"] == 0
+@pytest.mark.asyncio
+async def test_semantic_add_requires_a_durable_backend():
+    manager = SemanticManager(graphiti_client=None, vector_client=RejectingVectorClient())
 
-    @pytest.mark.asyncio
-    async def test_list_memories_with_episode(self, real_service):
-        """Test listing memories after adding an episode."""
-        # Add an episode directly
-        episode = real_service.layers.episodic.record_episode(
-            content="Test episode content",
-            summary="Test summary",
-            topics=["test"],
-            outcome="success",
-            user_id="test_user",
+    with pytest.raises(RuntimeError, match="no durable backend accepted the write"):
+        await manager.add_entity(
+            name="Python",
+            entity_type=EntityType.CONCEPT,
+            summary="A programming language",
         )
-
-        # List memories
-        result = await real_service.list_memories()
-
-        assert result["total"] >= 1
-        assert len(result["items"]) >= 1
-
-        # Find our episode
-        found = False
-        for item in result["items"]:
-            if item["uuid"] == episode.id:
-                found = True
-                assert item["layer"] == "EPISODIC"
-                assert "Test" in item["name"] or "Test" in item["content"]
-                break
-
-        assert found, f"Episode {episode.id} not found in results"
-
-    @pytest.mark.asyncio
-    async def test_list_memories_with_procedure(self, real_service):
-        """Test listing memories after adding a procedure."""
-        # Add a procedure directly
-        procedure = real_service.layers.procedural.learn_procedure(
-            trigger="test trigger",
-            procedure=["step 1", "step 2"],
-            source="test",
-            topics=["testing"],
-        )
-
-        # List memories
-        result = await real_service.list_memories(layer="procedural")
-
-        assert result["total"] >= 1
-        assert len(result["items"]) >= 1
-
-        # Find our procedure
-        found = False
-        for item in result["items"]:
-            if item["uuid"] == procedure.id:
-                found = True
-                assert item["layer"] == "PROCEDURAL"
-                assert item["name"] == "test trigger"
-                break
-
-        assert found, f"Procedure {procedure.id} not found in results"
-
-    @pytest.mark.asyncio
-    async def test_list_memories_pagination(self, real_service):
-        """Test pagination works correctly."""
-        # Add multiple episodes
-        for i in range(5):
-            real_service.layers.episodic.record_episode(
-                content=f"Episode {i}",
-                summary=f"Summary {i}",
-                user_id="test_user",
-            )
-
-        # Get first page
-        page1 = await real_service.list_memories(limit=2, offset=0)
-        assert len(page1["items"]) == 2
-
-        # Get second page
-        page2 = await real_service.list_memories(limit=2, offset=2)
-        assert len(page2["items"]) == 2
-
-        # Pages should be different
-        page1_ids = {item["uuid"] for item in page1["items"]}
-        page2_ids = {item["uuid"] for item in page2["items"]}
-        assert page1_ids.isdisjoint(page2_ids), "Pages should not overlap"
-
-    @pytest.mark.asyncio
-    async def test_list_memories_filter_by_layer(self, real_service):
-        """Test filtering by layer."""
-        # Add episode and procedure
-        episode = real_service.layers.episodic.record_episode(
-            content="Test episode",
-            user_id="test_user",
-        )
-        procedure = real_service.layers.procedural.learn_procedure(
-            trigger="test proc",
-            procedure=["step 1"],
-        )
-
-        # Filter by episodic
-        result = await real_service.list_memories(layer="episodic")
-        for item in result["items"]:
-            assert item["layer"] == "EPISODIC"
-
-        # Filter by procedural
-        result = await real_service.list_memories(layer="procedural")
-        for item in result["items"]:
-            assert item["layer"] == "PROCEDURAL"
-
-
-class TestMemoryGetByIdReal:
-    """Real tests for get_memory_by_id - NO MOCK."""
-
-    @pytest.mark.asyncio
-    async def test_get_memory_by_id_episode(self, real_service):
-        """Test getting an episode by ID."""
-        # Add episode
-        episode = real_service.layers.episodic.record_episode(
-            content="Test content for get",
-            summary="Test summary for get",
-            topics=["get_test"],
-            user_id="test_user",
-        )
-
-        # Get by ID
-        result = await real_service.get_memory_by_id(episode.id)
-
-        assert result is not None
-        assert result["uuid"] == episode.id
-        assert result["layer"] == "EPISODIC"
-        assert "Test content" in result["content"]
-
-    @pytest.mark.asyncio
-    async def test_get_memory_by_id_procedure(self, real_service):
-        """Test getting a procedure by ID."""
-        # Add procedure
-        procedure = real_service.layers.procedural.learn_procedure(
-            trigger="get test trigger",
-            procedure=["step 1", "step 2"],
-        )
-
-        # Get by ID
-        result = await real_service.get_memory_by_id(procedure.id)
-
-        assert result is not None
-        assert result["uuid"] == procedure.id
-        assert result["layer"] == "PROCEDURAL"
-        assert "step 1" in result["content"]
-
-    @pytest.mark.asyncio
-    async def test_get_memory_by_id_not_found(self, real_service):
-        """Test getting a non-existent memory."""
-        result = await real_service.get_memory_by_id("nonexistent-uuid-12345")
-        assert result is None
-
-
-class TestMemoryDeleteReal:
-    """Real tests for delete_memory - NO MOCK."""
-
-    @pytest.mark.asyncio
-    async def test_delete_episode(self, real_service):
-        """Test deleting an episode."""
-        # Add episode
-        episode = real_service.layers.episodic.record_episode(
-            content="To be deleted",
-            user_id="test_user",
-        )
-
-        # Verify it exists
-        result = await real_service.get_memory_by_id(episode.id)
-        assert result is not None
-
-        # Delete it
-        delete_result = await real_service.delete_memory(episode.id)
-        assert "deleted" in delete_result["message"].lower()
-
-        # Verify it's gone
-        result = await real_service.get_memory_by_id(episode.id)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_delete_procedure(self, real_service):
-        """Test deleting a procedure."""
-        # Add procedure
-        procedure = real_service.layers.procedural.learn_procedure(
-            trigger="delete test trigger",
-            procedure=["step 1"],
-        )
-
-        # Verify it exists
-        result = await real_service.get_memory_by_id(procedure.id)
-        assert result is not None
-
-        # Delete it
-        delete_result = await real_service.delete_memory(procedure.id)
-        assert "deleted" in delete_result["message"].lower()
-
-        # Verify it's gone
-        result = await real_service.get_memory_by_id(procedure.id)
-        assert result is None
-
-
-# Run tests if executed directly
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

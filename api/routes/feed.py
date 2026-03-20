@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 
 from api.config import settings
 from api.deps import get_synapse_service, get_event_bus
+from api.normalization import api_layer_value, coerce_utc_datetime, utcnow
 from api.models import (
     FeedEvent,
     FeedEventListResponse,
@@ -40,18 +41,18 @@ def _normalize_feed_layer(layer: Optional[str]) -> Optional[str]:
     """Normalize feed layer names for the frontend."""
     if layer is None:
         return None
+    if str(layer).strip().lower() == "all":
+        return "ALL"
+    normalized = api_layer_value(layer)
+    if normalized == "USER_MODEL":
+        return "USER"
+    return normalized
 
-    normalized = str(layer).strip().lower().replace("-", "_")
-    aliases = {
-        "user": "USER",
-        "user_model": "USER",
-        "procedural": "PROCEDURAL",
-        "semantic": "SEMANTIC",
-        "episodic": "EPISODIC",
-        "working": "WORKING",
-        "all": "ALL",
-    }
-    return aliases.get(normalized)
+
+def _normalize_event_type(event_type: object) -> str:
+    """Normalize internal event types into a stable action key."""
+    raw = event_type.value if hasattr(event_type, "value") else event_type
+    return str(raw).strip().replace(".", "_").upper()
 
 
 @router.get("/", response_model=FeedEventListResponse)
@@ -66,19 +67,19 @@ async def get_feed(
     events = []
     existing_ids = set()
     normalized_filter = _normalize_feed_layer(layer)
+    normalized_since = coerce_utc_datetime(since)
 
     # First: pull from EventBus ring buffer (real-time events)
     if event_bus is not None:
         try:
             bus_events = await event_bus.get_recent(
                 limit=settings.feed_buffer_size,
-                since=since,
+                since=normalized_since,
             )
             for e in bus_events:
-                event_type = getattr(e, 'type', 'MEMORY_ADD')
-                if hasattr(event_type, 'value'):
-                    event_type = event_type.value
-                action = _TYPE_TO_ACTION.get(str(event_type).upper(), "ADD")
+                event_type = getattr(e, "type", "MEMORY_ADD")
+                normalized_type = _normalize_event_type(event_type)
+                action = _TYPE_TO_ACTION.get(normalized_type, "ADD")
                 eid = str(getattr(e, 'id', ''))
                 event_layer = _normalize_feed_layer(getattr(e, 'layer', None))
 
@@ -87,30 +88,26 @@ async def get_feed(
 
                 events.append(FeedEvent(
                     id=eid,
-                    type=str(event_type),
+                    type=normalized_type,
                     layer=event_layer,
                     action=action,
                     summary=getattr(e, 'summary', ''),
                     detail=getattr(e, 'detail', None),
                     metadata=getattr(e, 'detail', None),
-                    timestamp=getattr(e, 'timestamp', datetime.utcnow()),
+                    timestamp=coerce_utc_datetime(getattr(e, "timestamp", None)) or utcnow(),
                 ))
                 existing_ids.add(eid)
-        except Exception as e:
-            print(f"[DEBUG] EventBus error: {e}")
+        except Exception:
+            pass
 
     # Second: pull from SynapseService (episodic layer + graph)
     try:
         result = await service.get_feed_events(
             layer=layer if layer and layer.upper() != "ALL" else None,
             limit=limit,
-            since=since,
+            since=normalized_since,
         )
-        print(f"[DEBUG] get_feed_events returned {len(result.get('events', []))} events")
-    except Exception as e:
-        print(f"[DEBUG] get_feed_events error: {e}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
         result = {"events": []}
 
     for e in result.get("events", []):
@@ -118,8 +115,8 @@ async def get_feed(
         if eid in existing_ids:
             continue
 
-        event_type = e.get("type", "MEMORY_ADD")
-        action = _TYPE_TO_ACTION.get(str(event_type).upper(), "ADD")
+        event_type = _normalize_event_type(e.get("type", "MEMORY_ADD"))
+        action = _TYPE_TO_ACTION.get(event_type, "ADD")
 
         detail = e.get("detail", {}) or {}
         metadata = {}
@@ -138,11 +135,11 @@ async def get_feed(
             source=detail.get("source"),
             detail=detail,
             metadata=metadata or None,
-            timestamp=e.get("timestamp", datetime.utcnow()),
+            timestamp=coerce_utc_datetime(e.get("timestamp")) or utcnow(),
         ))
 
     # Sort by timestamp descending
-    events.sort(key=lambda x: x.timestamp, reverse=True)
+    events.sort(key=lambda x: coerce_utc_datetime(x.timestamp) or utcnow(), reverse=True)
     events = events[:limit]
 
     return FeedEventListResponse(
@@ -175,7 +172,7 @@ async def feed_stream(
     async def event_generator():
         try:
             # Send initial connection message
-            yield f"data: {{\"type\": \"connected\", \"timestamp\": \"{datetime.utcnow().isoformat()}\"}}\n\n"
+            yield f"data: {{\"type\": \"connected\", \"timestamp\": \"{utcnow().isoformat()}\"}}\n\n"
 
             while True:
                 try:
@@ -184,7 +181,7 @@ async def feed_stream(
                     yield f"data: {event.json()}\n\n"
                 except asyncio.TimeoutError:
                     # Send heartbeat
-                    yield f"data: {{\"type\": \"heartbeat\", \"timestamp\": \"{datetime.utcnow().isoformat()}\"}}\n\n"
+                    yield f"data: {{\"type\": \"heartbeat\", \"timestamp\": \"{utcnow().isoformat()}\"}}\n\n"
         except asyncio.CancelledError:
             # Client disconnected
             pass

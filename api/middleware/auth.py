@@ -4,7 +4,7 @@ Authentication middleware for Synapse API.
 Simple API key authentication for single-user system.
 """
 
-from fastapi import Request, HTTPException
+from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
@@ -23,16 +23,18 @@ class AuthMiddleware(BaseHTTPMiddleware):
     """
 
     EXEMPT_PATHS = {
+        "/",
         "/health",
         "/docs",
         "/redoc",
         "/openapi.json",
     }
+    EXEMPT_PREFIXES = ("/docs", "/redoc")
 
     async def dispatch(self, request: Request, call_next):
         # Check if path is exempt
         path = request.url.path
-        if any(path.startswith(exempt) for exempt in self.EXEMPT_PATHS):
+        if path in self.EXEMPT_PATHS or any(path.startswith(prefix) for prefix in self.EXEMPT_PREFIXES):
             return await call_next(request)
 
         # Check API key

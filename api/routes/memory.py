@@ -14,6 +14,7 @@ Endpoints:
 from fastapi import APIRouter, Depends, Query, HTTPException
 
 from api.deps import get_synapse_service, get_event_bus
+from api.normalization import parse_api_memory_layer, parse_core_memory_layer
 from api.services.event_bus import FeedEventType
 from api.models import (
     MemoryCreate,
@@ -32,13 +33,34 @@ from api.models import (
 router = APIRouter(tags=["Memory"])
 
 
+def _memory_response_from_result(result: dict, fallback_uuid: str = "") -> MemoryResponse:
+    """Build a response from a persisted memory record."""
+    layer = parse_api_memory_layer(result.get("layer")) or MemoryLayer.EPISODIC
+    return MemoryResponse(
+        uuid=result.get("uuid", fallback_uuid),
+        layer=layer,
+        name=result.get("name", ""),
+        content=result.get("content", ""),
+        source=result.get("source", "api"),
+        source_description=result.get("source_description"),
+        group_id=result.get("group_id"),
+        agent_id=result.get("agent_id"),
+        access_count=result.get("access_count", 0),
+        decay_score=result.get("decay_score"),
+        metadata=result.get("metadata", {}) or {},
+        created_at=result.get("created_at"),
+        updated_at=result.get("updated_at"),
+        last_accessed=result.get("last_accessed"),
+    )
+
+
 @router.get("/", response_model=MemoryListResponse)
 async def list_memories(
     layer: str = Query(None, description="Filter by layer"),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    sort: str = Query("created_at", regex="^(created_at|name|access_count)$"),
-    order: str = Query("desc", regex="^(asc|desc)$"),
+    sort: str = Query("created_at", pattern="^(created_at|name|access_count)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
     service=Depends(get_synapse_service),
 ):
     """List memories with pagination."""
@@ -50,20 +72,7 @@ async def list_memories(
         order=order,
     )
 
-    items = [
-        MemoryResponse(
-            uuid=m.get("uuid", str(i)),
-            layer=MemoryLayer(m.get("layer", "EPISODIC")),
-            name=m.get("name", ""),
-            content=m.get("content", ""),
-            source=m.get("source", "api"),
-            source_description=m.get("source_description"),
-            group_id=m.get("group_id"),
-            agent_id=m.get("agent_id"),
-            metadata=m.get("metadata", {}),
-        )
-        for i, m in enumerate(result.get("items", []))
-    ]
+    items = [_memory_response_from_result(m, fallback_uuid=str(i)) for i, m in enumerate(result.get("items", []))]
 
     return MemoryListResponse(
         items=items,
@@ -84,21 +93,7 @@ async def get_memory(
     if not result:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
 
-    return MemoryResponse(
-        uuid=memory_id,
-        layer=MemoryLayer(result.get("layer", "EPISODIC")),
-        name=result.get("name", ""),
-        content=result.get("content", ""),
-        source=result.get("source", "api"),
-        source_description=result.get("source_description"),
-        group_id=result.get("group_id"),
-        agent_id=result.get("agent_id"),
-        access_count=result.get("access_count", 0),
-        metadata=result.get("metadata", {}),
-        created_at=result.get("created_at"),
-        updated_at=result.get("updated_at"),
-        last_accessed=result.get("last_accessed"),
-    )
+    return _memory_response_from_result(result, fallback_uuid=memory_id)
 
 
 @router.post("/", response_model=MemoryResponse)
@@ -114,39 +109,26 @@ async def add_memory(
         source=request.source,
         source_description=request.source_description or "",
         group_id=request.group_id,
+        agent_id=request.agent_id,
+        layer=request.layer,
+        metadata=request.metadata,
     )
 
     # Emit feed event
     if event_bus:
         await event_bus.emit(
             event_type=FeedEventType.MEMORY_ADD,
-            summary=f"Added memory: {request.name}",
+            summary=f"Added memory: {result.get('name', request.name)}",
             layer=result.get("layer", "EPISODIC"),
             detail={
-                "name": request.name,
-                "source": request.source,
+                "uuid": result.get("uuid"),
+                "name": result.get("name", request.name),
+                "source": result.get("source", request.source),
                 "layer": result.get("layer"),
             },
         )
 
-    # Determine the layer from classification result
-    detected_layer = result.get("layer", "EPISODIC")
-    try:
-        layer_enum = MemoryLayer(detected_layer)
-    except ValueError:
-        layer_enum = request.layer or MemoryLayer.EPISODIC
-
-    return MemoryResponse(
-        uuid=result.get("uuid", ""),
-        layer=layer_enum,
-        name=request.name,
-        content=request.content,
-        source=request.source,
-        source_description=request.source_description,
-        group_id=request.group_id,
-        agent_id=request.agent_id,
-        metadata=request.metadata or {},
-    )
+    return _memory_response_from_result(result)
 
 
 @router.post("/search", response_model=MemorySearchResponse)
@@ -155,7 +137,13 @@ async def search_memories(
     service=Depends(get_synapse_service),
 ):
     """Search memories across layers."""
-    layers = [l.value for l in request.layers] if request.layers else None
+    layers = None
+    if request.layers:
+        layers = []
+        for value in request.layers:
+            layer = parse_core_memory_layer(value)
+            if layer is not None:
+                layers.append(layer.value)
 
     result = await service.search_memory(
         query=request.query,
@@ -172,6 +160,10 @@ async def search_memories(
                 uid = item.get("uuid", item.get("id", ""))
                 name = item.get("name", item.get("trigger", ""))
                 content = item.get("content", item.get("episode_body", ""))
+                if not content:
+                    steps = item.get("steps") or item.get("procedure")
+                    if isinstance(steps, list):
+                        content = "\n".join(str(step) for step in steps)
                 score = item.get("score", 1.0)
                 highlight = item.get("highlight")
                 metadata = item.get("metadata", {})
@@ -180,15 +172,13 @@ async def search_memories(
                 name = getattr(item, 'name', getattr(item, 'trigger', ''))
                 content = getattr(item, 'content', getattr(item, 'episode_body', ''))
                 if hasattr(item, 'procedure') and not content:
-                    content = str(item.procedure)
+                    steps = getattr(item, "procedure")
+                    content = "\n".join(str(step) for step in steps) if isinstance(steps, list) else str(steps)
                 score = getattr(item, 'score', 1.0)
                 highlight = None
                 metadata = {}
 
-            try:
-                layer_enum = MemoryLayer(layer_name.upper())
-            except ValueError:
-                layer_enum = MemoryLayer.EPISODIC
+            layer_enum = parse_api_memory_layer(layer_name) or MemoryLayer.EPISODIC
 
             results.append(MemorySearchResult(
                 uuid=str(uid),
@@ -216,7 +206,7 @@ async def search_memories(
         results=results,
         total=len(results),
         query=request.query,
-        layers_searched=layers or ["all"],
+        layers_searched=[parse_api_memory_layer(layer).value for layer in layers] if layers else ["all"],
     )
 
 
@@ -260,17 +250,7 @@ async def update_memory(
     if not result:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
 
-    return MemoryResponse(
-        uuid=memory_id,
-        layer=MemoryLayer(result.get("layer", "EPISODIC")),
-        name=result.get("name", ""),
-        content=result.get("content", request.content or ""),
-        source=result.get("source", "api"),
-        source_description=result.get("source_description"),
-        group_id=result.get("group_id"),
-        agent_id=result.get("agent_id"),
-        metadata=result.get("metadata", request.metadata or {}),
-    )
+    return _memory_response_from_result(result, fallback_uuid=memory_id)
 
 
 @router.delete("/{memory_id}", response_model=SuccessResponse)

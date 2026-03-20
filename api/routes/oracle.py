@@ -10,6 +10,7 @@ Endpoints:
 from fastapi import APIRouter, Depends
 
 from api.deps import get_synapse_service
+from api.normalization import parse_api_memory_layer, parse_core_memory_layer
 from api.models import (
     ConsultRequest,
     ConsultResponse,
@@ -31,7 +32,13 @@ async def consult(
     service=Depends(get_synapse_service),
 ):
     """Consult memory for guidance."""
-    layers = [l.value for l in request.layers] if request.layers else None
+    layers = None
+    if request.layers:
+        layers = []
+        for layer in request.layers:
+            normalized = parse_core_memory_layer(layer)
+            if normalized is not None:
+                layers.append(normalized.value)
 
     result = await service.consult(
         query=request.query,
@@ -42,9 +49,8 @@ async def consult(
     # Parse layer summaries - service returns {layer_name: [items]}
     layer_summaries = {}
     for layer_name, layer_data in result.get("layers", {}).items():
-        try:
-            layer_enum = MemoryLayer(layer_name.upper())
-        except ValueError:
+        layer_enum = parse_api_memory_layer(layer_name)
+        if layer_enum is None:
             continue
 
         # layer_data is a list of items from search_all
@@ -58,7 +64,7 @@ async def consult(
             else:
                 top_results.append({"preview": str(item)[:200]})
 
-        layer_summaries[layer_name] = LayerSummary(
+        layer_summaries[layer_enum.value] = LayerSummary(
             layer=layer_enum,
             count=len(items),
             top_results=top_results,

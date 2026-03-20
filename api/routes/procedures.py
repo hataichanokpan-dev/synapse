@@ -26,6 +26,25 @@ from api.models import (
 router = APIRouter(tags=["Procedures"])
 
 
+def _procedure_response_from_result(result: dict, fallback_uuid: str = "") -> ProcedureResponse:
+    """Build a procedure response from persisted data."""
+    return ProcedureResponse(
+        uuid=result.get("uuid", fallback_uuid),
+        trigger=result.get("trigger", result.get("name", "")),
+        steps=result.get("steps", result.get("metadata", {}).get("steps", [])),
+        topics=result.get("topics", result.get("metadata", {}).get("topics", [])),
+        source=result.get("source", "api"),
+        source_description=result.get("source_description"),
+        success_count=result.get("success_count", result.get("access_count", 0)),
+        failure_count=result.get("failure_count", 0),
+        decay_score=result.get("decay_score"),
+        metadata=result.get("metadata", {}) or {},
+        created_at=result.get("created_at"),
+        updated_at=result.get("updated_at"),
+        last_used=result.get("last_used", result.get("last_accessed")),
+    )
+
+
 @router.get("/", response_model=ProcedureListResponse)
 async def list_procedures(
     trigger: str = Query(None, description="Filter by trigger pattern"),
@@ -91,43 +110,37 @@ async def add_procedure(
             },
         )
 
-    return ProcedureResponse(
-        uuid=result.get("uuid", "new"),
-        trigger=request.trigger,
-        steps=request.steps,
-        topics=request.topics,
-        source=request.source,
-        source_description=request.source_description,
-    )
+    return _procedure_response_from_result(result)
 
 
-@router.post("/{trigger:path}/success", response_model=ProcedureSuccessResponse)
+@router.post("/{procedure_id:path}/success", response_model=ProcedureSuccessResponse)
 async def record_procedure_success(
-    trigger: str,
+    procedure_id: str,
     service=Depends(get_synapse_service),
     event_bus=Depends(get_event_bus),
 ):
     """Record successful procedure execution."""
-    result = service.record_procedure_success(procedure_id=trigger)
+    result = service.record_procedure_success(procedure_id=procedure_id)
 
     if not result:
-        raise HTTPException(status_code=404, detail=f"Procedure '{trigger}' not found")
+        raise HTTPException(status_code=404, detail=f"Procedure '{procedure_id}' not found")
 
     # Emit feed event
     if event_bus:
         await event_bus.emit(
             event_type=FeedEventType.PROCEDURE_SUCCESS,
-            summary=f"Procedure succeeded: {trigger}",
+            summary=f"Procedure succeeded: {result.get('trigger', procedure_id)}",
             layer="PROCEDURAL",
             detail={
-                "trigger": trigger,
+                "uuid": result.get("uuid", procedure_id),
+                "trigger": result.get("trigger", procedure_id),
                 "success_count": result.get("success_count", 1),
             },
         )
 
     return ProcedureSuccessResponse(
-        uuid=result.get("uuid", trigger),
-        trigger=trigger,
+        uuid=result.get("uuid", procedure_id),
+        trigger=result.get("trigger", procedure_id),
         success_count=result.get("success_count", 1),
     )
 
@@ -143,16 +156,7 @@ async def get_procedure(
     if not result:
         raise HTTPException(status_code=404, detail=f"Procedure {procedure_id} not found")
 
-    return ProcedureResponse(
-        uuid=result.get("uuid", procedure_id),
-        trigger=result.get("trigger", ""),
-        steps=result.get("steps", []),
-        topics=result.get("topics", []),
-        source=result.get("source", "api"),
-        source_description=result.get("source_description"),
-        success_count=result.get("success_count", 0),
-        failure_count=result.get("failure_count", 0),
-    )
+    return _procedure_response_from_result(result, fallback_uuid=procedure_id)
 
 
 @router.put("/{procedure_id}", response_model=ProcedureResponse)
@@ -172,15 +176,7 @@ async def update_procedure(
     if not result:
         raise HTTPException(status_code=404, detail=f"Procedure {procedure_id} not found")
 
-    return ProcedureResponse(
-        uuid=procedure_id,
-        trigger=result.get("trigger", request.trigger or ""),
-        steps=result.get("steps", request.steps or []),
-        topics=result.get("topics", request.topics or []),
-        source=result.get("source", "api"),
-        success_count=result.get("success_count", 0),
-        failure_count=result.get("failure_count", 0),
-    )
+    return _procedure_response_from_result(result, fallback_uuid=procedure_id)
 
 
 @router.delete("/{procedure_id}", response_model=SuccessResponse)

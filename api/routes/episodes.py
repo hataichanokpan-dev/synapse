@@ -25,8 +25,8 @@ async def list_episodes(
     group_id: str = Query(None, description="Filter by group ID"),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    sort: str = Query("created_at", regex="^(created_at|name)$"),
-    order: str = Query("desc", regex="^(asc|desc)$"),
+    sort: str = Query("created_at", pattern="^(created_at|name)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
     service=Depends(get_synapse_service),
 ):
     """List episodes from both local storage and knowledge graph."""

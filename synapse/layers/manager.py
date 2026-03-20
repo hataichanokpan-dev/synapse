@@ -296,7 +296,18 @@ class LayerManager:
             results[MemoryLayer.SEMANTIC] = await self.search_semantic(query, limit_per_layer)
 
         if MemoryLayer.EPISODIC in layers:
-            results[MemoryLayer.EPISODIC] = self.find_episodes_by_topic(query, limit_per_layer)
+            episodic_results = self.episodic.find_episodes(
+                query=query,
+                user_id=user_id,
+                limit=limit_per_layer,
+            )
+            if not episodic_results and query:
+                episodic_results = self.episodic.find_episodes(
+                    topics=[query],
+                    user_id=user_id,
+                    limit=limit_per_layer,
+                )
+            results[MemoryLayer.EPISODIC] = episodic_results
 
         if MemoryLayer.WORKING in layers:
             results[MemoryLayer.WORKING] = self._search_working_memory(query, limit_per_layer)
