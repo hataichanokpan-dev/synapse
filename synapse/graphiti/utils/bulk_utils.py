@@ -180,7 +180,7 @@ async def add_nodes_and_edges_bulk_tx(
 
         if driver.provider == GraphProvider.KUZU:
             attributes = convert_datetimes_to_strings(node.attributes) if node.attributes else {}
-            entity_data['attributes'] = json.dumps(attributes)
+            entity_data['attributes'] = json.dumps(attributes, ensure_ascii=False)
         else:
             entity_data.update(node.attributes or {})
 
@@ -207,7 +207,7 @@ async def add_nodes_and_edges_bulk_tx(
 
         if driver.provider == GraphProvider.KUZU:
             attributes = convert_datetimes_to_strings(edge.attributes) if edge.attributes else {}
-            edge_data['attributes'] = json.dumps(attributes)
+            edge_data['attributes'] = json.dumps(attributes, ensure_ascii=False)
         else:
             edge_data.update(edge.attributes or {})
 

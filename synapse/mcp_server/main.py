@@ -19,6 +19,8 @@ from pathlib import Path
 # Fix UTF-8 encoding for Windows stdio (Thai language support)
 # Windows defaults to cp1252 which doesn't support Thai characters
 if sys.platform == 'win32':
+    if hasattr(sys.stdin, 'buffer'):
+        sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='replace')
     if hasattr(sys.stdout, 'buffer'):
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     if hasattr(sys.stderr, 'buffer'):

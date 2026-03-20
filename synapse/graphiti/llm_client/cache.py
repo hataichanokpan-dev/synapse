@@ -50,7 +50,7 @@ class LLMCache:
 
     def set(self, key: str, value: dict[str, typing.Any]) -> None:
         try:
-            serialized = json.dumps(value)
+            serialized = json.dumps(value, ensure_ascii=False)
         except TypeError:
             logger.warning(f'Non-JSON-serializable cache value for key {key}, skipping')
             return
