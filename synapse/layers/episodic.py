@@ -190,6 +190,7 @@ class EpisodicManager:
             memory_layer=MemoryLayer(row["memory_layer"]),
             recorded_at=self._parse_datetime(row["recorded_at"]) or utcnow(),
             expires_at=self._parse_datetime(row["expires_at"]) if row["expires_at"] else None,
+            access_count=row["access_count"],
             user_id=row["user_id"],
             session_id=row["session_id"],
         )
@@ -386,6 +387,7 @@ class EpisodicManager:
             memory_layer=MemoryLayer.EPISODIC,
             recorded_at=now,
             expires_at=expires_at,
+            access_count=0,
             user_id=user_id,
             session_id=session_id,
         )
@@ -404,7 +406,7 @@ class EpisodicManager:
                     content_fts,
                     summary,
                     summary_fts,
-                    json.dumps(topics or []),
+                    json.dumps(topics or [], ensure_ascii=False),
                     outcome,
                     MemoryLayer.EPISODIC.value,
                     now.isoformat(),
@@ -462,6 +464,7 @@ class EpisodicManager:
                 memory_layer=MemoryLayer(row["memory_layer"]),
                 recorded_at=self._parse_datetime(row["recorded_at"]),
                 expires_at=new_expires or current_expires,
+                access_count=row["access_count"] + (1 if new_expires is not None else 0),
                 user_id=row["user_id"],
                 session_id=row["session_id"],
             )
@@ -629,6 +632,7 @@ class EpisodicManager:
                     memory_layer=MemoryLayer(row["memory_layer"]),
                     recorded_at=self._parse_datetime(row["recorded_at"]),
                     expires_at=self._parse_datetime(row["expires_at"]) if row["expires_at"] else None,
+                    access_count=row["access_count"],
                     user_id=row["user_id"],
                     session_id=row["session_id"],
                 )
@@ -1020,7 +1024,7 @@ class EpisodicManager:
 
             if topics is not None:
                 updates.append("topics = ?")
-                params.append(json.dumps(topics))
+                params.append(json.dumps(topics, ensure_ascii=False))
 
             if outcome is not None:
                 updates.append("outcome = ?")

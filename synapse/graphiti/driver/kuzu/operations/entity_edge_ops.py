@@ -52,7 +52,7 @@ class KuzuEntityEdgeOperations(EntityEdgeOperations):
             'expired_at': edge.expired_at,
             'valid_at': edge.valid_at,
             'invalid_at': edge.invalid_at,
-            'attributes': json.dumps(edge.attributes or {}),
+            'attributes': json.dumps(edge.attributes or {}, ensure_ascii=False),
         }
 
         query = get_entity_edge_save_query(GraphProvider.KUZU)

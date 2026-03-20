@@ -172,6 +172,9 @@ class ProceduralManager:
             success_count=row["success_count"],
             last_used=self._parse_datetime(row["last_used"]) if row["last_used"] else None,
             topics=json.loads(row["topics"]),
+            created_at=self._parse_datetime(row["created_at"]),
+            updated_at=self._parse_datetime(row["updated_at"]),
+            decay_score=float(row["decay_score"]),
         )
 
     def _index_procedure(
@@ -327,6 +330,9 @@ class ProceduralManager:
             success_count=0,
             last_used=None,
             topics=topics or [],
+            created_at=now,
+            updated_at=now,
+            decay_score=1.0,
         )
 
         with self._get_connection() as conn:
@@ -341,11 +347,11 @@ class ProceduralManager:
                     proc_id,
                     trigger,
                     trigger_fts,
-                    json.dumps(procedure),
+                    json.dumps(procedure, ensure_ascii=False),
                     source,
                     0,
                     None,
-                    json.dumps(topics or []),
+                    json.dumps(topics or [], ensure_ascii=False),
                     now.isoformat(),
                     now.isoformat(),
                 )
@@ -502,6 +508,90 @@ class ProceduralManager:
                 WHERE id = ?
                 """,
                 (new_success_count, now.isoformat(), now.isoformat(), decay_score, procedure_id)
+            )
+
+            cursor = conn.execute(
+                "SELECT * FROM procedures WHERE id = ?",
+                (procedure_id,),
+            )
+            updated_row = cursor.fetchone()
+
+        if updated_row is None:
+            return None
+
+        self._index_procedure_row(updated_row)
+        return self._row_to_procedure(updated_row)
+
+    def update_procedure(
+        self,
+        procedure_id: str,
+        trigger: Optional[str] = None,
+        steps: Optional[List[str]] = None,
+        topics: Optional[List[str]] = None,
+        preprocess: bool = True,
+    ) -> Optional[ProceduralMemory]:
+        """
+        Update an existing procedure and refresh indexes.
+
+        Args:
+            procedure_id: Procedure identifier
+            trigger: Optional new trigger
+            steps: Optional new steps
+            topics: Optional new topics
+            preprocess: Apply Thai NLP tokenization when trigger changes
+
+        Returns:
+            Updated ProceduralMemory or None if not found
+        """
+        now = utcnow()
+        updated_row = None
+
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM procedures WHERE id = ?",
+                (procedure_id,),
+            )
+            row = cursor.fetchone()
+
+            if row is None:
+                return None
+
+            updates = ["updated_at = ?"]
+            params = [now.isoformat()]
+
+            if trigger is not None:
+                updates.append("trigger = ?")
+                params.append(trigger)
+
+                trigger_fts = trigger
+                if preprocess:
+                    preprocessor = _get_nlp_preprocessor()
+                    if preprocessor:
+                        trigger_fts = preprocessor.tokenize_for_fts(trigger)
+                updates.append("trigger_fts = ?")
+                params.append(trigger_fts)
+
+            if steps is not None:
+                updates.append("procedure = ?")
+                params.append(json.dumps(steps, ensure_ascii=False))
+
+            if topics is not None:
+                updates.append("topics = ?")
+                params.append(json.dumps(topics, ensure_ascii=False))
+
+            decay_score = compute_decay_score(
+                updated_at=now,
+                access_count=row["success_count"],
+                memory_layer=MemoryLayer.PROCEDURAL,
+                now=now,
+            )
+            updates.append("decay_score = ?")
+            params.append(decay_score)
+
+            params.append(procedure_id)
+            conn.execute(
+                f"UPDATE procedures SET {', '.join(updates)} WHERE id = ?",
+                params,
             )
 
             cursor = conn.execute(

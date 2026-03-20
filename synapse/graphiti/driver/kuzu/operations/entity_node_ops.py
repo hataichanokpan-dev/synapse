@@ -40,7 +40,7 @@ class KuzuEntityNodeOperations(EntityNodeOperations):
         tx: Transaction | None = None,
     ) -> None:
         # Kuzu uses individual SET per property, attributes serialized as JSON
-        attrs_json = json.dumps(node.attributes or {})
+        attrs_json = json.dumps(node.attributes or {}, ensure_ascii=False)
         params: dict[str, Any] = {
             'uuid': node.uuid,
             'name': node.name,

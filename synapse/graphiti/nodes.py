@@ -551,7 +551,7 @@ class EntityNode(Node):
         }
 
         if driver.provider == GraphProvider.KUZU:
-            entity_data['attributes'] = json.dumps(self.attributes)
+            entity_data['attributes'] = json.dumps(self.attributes, ensure_ascii=False)
             entity_data['labels'] = list(set(self.labels + ['Entity']))
             result = await driver.execute_query(
                 get_entity_node_save_query(driver.provider, labels=''),

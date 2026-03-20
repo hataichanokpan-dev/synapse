@@ -185,7 +185,7 @@ class SyncQueue:
                 operation,
                 entity_type,
                 entity_id,
-                json.dumps(payload),
+                json.dumps(payload, ensure_ascii=False),
                 max_attempts,
                 now,
                 now,

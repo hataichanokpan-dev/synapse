@@ -195,9 +195,9 @@ class UserModelManager:
                     model.response_style,
                     model.response_length,
                     model.timezone,
-                    json.dumps(model.expertise),
-                    json.dumps(model.common_topics),
-                    json.dumps(model.notes),
+                    json.dumps(model.expertise, ensure_ascii=False),
+                    json.dumps(model.common_topics, ensure_ascii=False),
+                    json.dumps(model.notes, ensure_ascii=False),
                     now.isoformat(),  # created_at (use now for upsert)
                     now.isoformat(),
                 )
