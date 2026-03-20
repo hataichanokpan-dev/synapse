@@ -139,7 +139,8 @@ class MockLLMProvider:
                         {'name': 'TestEntity1', 'type': 'PERSON'},
                         {'name': 'TestEntity2', 'type': 'ORGANIZATION'},
                     ]
-                }
+                },
+                ensure_ascii=False,
             )
         elif 'summarize' in prompt.lower():
             return 'This is a test summary of the provided content.'
@@ -168,6 +169,7 @@ async def graphiti_test_client(
     env = {
         'DATABASE_PROVIDER': database,
         'OPENAI_API_KEY': os.environ.get('OPENAI_API_KEY', 'test_key' if use_mock_llm else None),
+        'PYTHONIOENCODING': 'utf-8',
     }
 
     # Database-specific configuration

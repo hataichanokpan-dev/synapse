@@ -32,6 +32,7 @@ class GraphitiMCPIntegrationTest:
                 'NEO4J_USER': os.environ.get('NEO4J_USER', 'neo4j'),
                 'NEO4J_PASSWORD': os.environ.get('NEO4J_PASSWORD', 'graphiti'),
                 'OPENAI_API_KEY': os.environ.get('OPENAI_API_KEY', 'dummy_key_for_testing'),
+                'PYTHONIOENCODING': 'utf-8',
             },
         )
 
@@ -138,7 +139,7 @@ class GraphitiMCPIntegrationTest:
                 'add_memory',
                 {
                     'name': 'Company Profile',
-                    'episode_body': json.dumps(json_data),
+                    'episode_body': json.dumps(json_data, ensure_ascii=False),
                     'source': 'json',
                     'source_description': 'CRM data',
                     'group_id': self.test_group_id,

@@ -110,7 +110,7 @@ class MCPIntegrationTest:
             'add_memory',
             {
                 'name': 'Company Profile',
-                'episode_body': json.dumps(json_data),
+                'episode_body': json.dumps(json_data, ensure_ascii=False),
                 'source': 'json',
                 'source_description': 'CRM data',
                 'group_id': self.test_group_id,
