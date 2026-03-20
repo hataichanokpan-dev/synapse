@@ -72,6 +72,10 @@ services:
 
       # Performance
       - SEMAPHORE_LIMIT=${SEMAPHORE_LIMIT:-10}
+
+      # UTF-8 Encoding (Thai language support)
+      - PYTHONIOENCODING=utf-8
+      - LANG=C.UTF-8
     volumes:
       - synapse_sqlite_data:/app/.synapse
     depends_on:
@@ -120,6 +124,10 @@ services:
       - EMBEDDER_PROVIDER=${EMBEDDER_PROVIDER:-openai}
       - USER_ID=${USER_ID:-cerberus}
       - FEED_BUFFER_SIZE=${FEED_BUFFER_SIZE:-500}
+
+      # UTF-8 Encoding (Thai language support)
+      - PYTHONIOENCODING=utf-8
+      - LANG=C.UTF-8
     volumes:
       - synapse_sqlite_data:/app/.synapse
     depends_on:

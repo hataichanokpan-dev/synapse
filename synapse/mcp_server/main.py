@@ -13,7 +13,16 @@ All arguments are passed through to the original server implementation.
 """
 
 import sys
+import io
 from pathlib import Path
+
+# Fix UTF-8 encoding for Windows stdio (Thai language support)
+# Windows defaults to cp1252 which doesn't support Thai characters
+if sys.platform == 'win32':
+    if hasattr(sys.stdout, 'buffer'):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    if hasattr(sys.stderr, 'buffer'):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # Add src directory to Python path for imports
 src_path = Path(__file__).parent / 'src'
