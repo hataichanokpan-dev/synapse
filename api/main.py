@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.config import settings
 from api.deps import init_services, shutdown_services
 from api.middleware import AuthMiddleware, ErrorHandlerMiddleware
+from api.responses import UTF8JSONResponse
 from api.routes import (
     identity_router,
     memory_router,
@@ -73,9 +74,13 @@ See `docs/plans/backend_api_plan.md` for full specification.
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
+    default_response_class=UTF8JSONResponse,
 )
 
-# CORS middleware
+# Middleware order matters:
+# add CORS last so it wraps auth/error responses and preflight requests.
+app.add_middleware(ErrorHandlerMiddleware)
+app.add_middleware(AuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -83,10 +88,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Error handler middleware
-app.add_middleware(AuthMiddleware)
-app.add_middleware(ErrorHandlerMiddleware)
 
 # Include routers
 app.include_router(identity_router, prefix="/api/identity", tags=["Identity"])

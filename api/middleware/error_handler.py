@@ -12,6 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from api.config import settings
+from api.responses import UTF8JSONResponse
 
 
 class ErrorHandlerMiddleware(BaseHTTPMiddleware):
@@ -28,7 +29,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         except HTTPException as exc:
             # FastAPI HTTPExceptions - pass through with consistent format
-            return JSONResponse(
+            return UTF8JSONResponse(
                 status_code=exc.status_code,
                 content={
                     "error": exc.detail if isinstance(exc.detail, str) else "Request error",
@@ -53,7 +54,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
             if settings.debug:
                 print(stack)
 
-            return JSONResponse(
+            return UTF8JSONResponse(
                 status_code=500,
                 content={
                     "error": "Internal server error",

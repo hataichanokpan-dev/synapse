@@ -9,6 +9,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from api.config import settings
+from api.responses import UTF8JSONResponse
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -41,7 +42,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         api_key = request.headers.get(settings.api_key_header)
 
         if not api_key:
-            return JSONResponse(
+            return UTF8JSONResponse(
                 status_code=401,
                 content={
                     "error": "Missing API key",
@@ -51,7 +52,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             )
 
         if api_key != settings.api_key:
-            return JSONResponse(
+            return UTF8JSONResponse(
                 status_code=401,
                 content={
                     "error": "Invalid API key",
