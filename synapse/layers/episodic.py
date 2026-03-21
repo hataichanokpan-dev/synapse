@@ -19,6 +19,7 @@ Thai NLP Integration:
 import json
 import logging
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -259,6 +260,20 @@ class EpisodicManager:
             access_count=row["access_count"],
         )
 
+    def _submit_vector_task(self, fn, *args, **kwargs) -> None:
+        """Run vector-store work off the request critical path."""
+        try:
+            thread = threading.Thread(
+                target=fn,
+                args=args,
+                kwargs=kwargs,
+                daemon=True,
+                name="episodic-vector",
+            )
+            thread.start()
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+
     def _delete_from_vector_store(self, episode_id: str) -> None:
         """Delete an episode point from Qdrant."""
         try:
@@ -416,7 +431,7 @@ class EpisodicManager:
                 )
             )
 
-        self._index_episode(episode, access_count=0)
+        self._submit_vector_task(self._index_episode, episode, 0)
         return episode
 
     def get_episode(self, episode_id: str) -> Optional[SynapseEpisode]:
@@ -469,9 +484,10 @@ class EpisodicManager:
                 session_id=row["session_id"],
             )
 
-        self._index_episode(
+        self._submit_vector_task(
+            self._index_episode,
             episode,
-            access_count=row["access_count"] + (1 if new_expires is not None else 0),
+            row["access_count"] + (1 if new_expires is not None else 0),
         )
         return episode
 
@@ -512,7 +528,7 @@ class EpisodicManager:
                 limit=limit,
                 include_expired=include_expired,
             )
-            if vector_results is not None:
+            if vector_results:
                 return vector_results
 
         episodes = []
@@ -529,6 +545,7 @@ class EpisodicManager:
             # Build query
             if search_query:
                 # Use FTS5 for full-text search
+                rows = []
                 try:
                     sql = """
                         SELECT e.* FROM episodes e
@@ -562,7 +579,10 @@ class EpisodicManager:
                     rows = cursor.fetchall()
 
                 except sqlite3.OperationalError:
-                    # FTS5 might not have data yet, fallback to LIKE
+                    rows = []
+
+                if not rows:
+                    # FTS5 might not have indexed data yet, fallback to LIKE
                     sql = "SELECT * FROM episodes WHERE 1=1"
                     params = []
 
@@ -690,8 +710,8 @@ class EpisodicManager:
 
                 # Delete from main table
                 conn.execute("DELETE FROM episodes WHERE id = ?", (episode_id,))
-                self._delete_from_vector_store(episode_id)
-                deleted_count += 1
+            self._submit_vector_task(self._delete_from_vector_store, episode_id)
+            deleted_count += 1
 
             # Clean up old archives (beyond retention period)
             if archive and archived_count > 0:
@@ -894,7 +914,7 @@ class EpisodicManager:
                 updated_row = cursor.fetchone()
 
         if updated_row is not None:
-            self._index_episode_row(updated_row)
+            self._submit_vector_task(self._index_episode_row, updated_row)
 
         return new_expires
 
@@ -956,7 +976,7 @@ class EpisodicManager:
             deleted = cursor.rowcount > 0
 
         if deleted:
-            self._delete_from_vector_store(episode_id)
+            self._submit_vector_task(self._delete_from_vector_store, episode_id)
 
         return deleted
 
@@ -1050,7 +1070,7 @@ class EpisodicManager:
 
         if updated_row:
             episode = self._row_to_episode(updated_row)
-            self._index_episode(episode, access_count=updated_row["access_count"])
+            self._submit_vector_task(self._index_episode, episode, updated_row["access_count"])
             return episode
 
         return None

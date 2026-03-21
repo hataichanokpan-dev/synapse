@@ -23,6 +23,13 @@ python scripts/pre_deploy_smoke.py --base-url http://127.0.0.1:8000 --api-key "$
 
 If the target environment has slow cold-start writes, increase the per-request timeout explicitly, for example `--timeout 60`.
 
+For SQLite-only baseline or safe smoke mode where graph/vector backends are intentionally disabled:
+
+```bash
+SYNAPSE_ENABLE_GRAPHITI=false SYNAPSE_ENABLE_QDRANT=false \
+python scripts/pre_deploy_smoke.py --base-url http://127.0.0.1:8000 --api-key "$SYNAPSE_API_KEY" --output-json artifacts/pre_deploy_smoke.sqlite_only.json
+```
+
 If graph is required:
 
 ```bash
@@ -42,6 +49,8 @@ python scripts/pre_deploy_smoke.py --base-url http://127.0.0.1:8000 --api-key "$
 - [ ] `CORS_ORIGINS` only includes approved origins.
 - [ ] Persistent storage for `~/.synapse` or the configured SQLite path is mounted and backed up.
 - [ ] Required secrets are present for the chosen backend mode.
+- [ ] `SYNAPSE_ENABLE_GRAPHITI` is explicitly set for this environment.
+- [ ] `SYNAPSE_ENABLE_QDRANT` is explicitly set for this environment.
 
 ## Backend Readiness
 
@@ -50,6 +59,8 @@ python scripts/pre_deploy_smoke.py --base-url http://127.0.0.1:8000 --api-key "$
 - [ ] If graph mode is required, FalkorDB is reachable and healthy.
 - [ ] If semantic/vector mode is required, Qdrant is reachable and healthy.
 - [ ] `SYNAPSE_REQUIRE_GRAPHITI=true` is only enabled when graph backend availability is guaranteed.
+- [ ] If graph is intentionally disabled in this environment, `SYNAPSE_ENABLE_GRAPHITI=false`.
+- [ ] If vector indexing/search is intentionally disabled in this environment, `SYNAPSE_ENABLE_QDRANT=false`.
 
 ## Functional Checks
 

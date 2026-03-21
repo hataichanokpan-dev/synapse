@@ -17,6 +17,7 @@ Thai NLP Integration:
 import json
 import logging
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
 from typing import Optional, List
@@ -247,6 +248,20 @@ class ProceduralManager:
         except Exception as exc:
             self._warn_vector_issue(exc)
 
+    def _submit_vector_task(self, fn, *args, **kwargs) -> None:
+        """Run vector-store work off the request critical path."""
+        try:
+            thread = threading.Thread(
+                target=fn,
+                args=args,
+                kwargs=kwargs,
+                daemon=True,
+                name="procedural-vector",
+            )
+            thread.start()
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+
     def _find_procedure_vector(
         self,
         trigger: str,
@@ -357,7 +372,8 @@ class ProceduralManager:
                 )
             )
 
-        self._index_procedure(
+        self._submit_vector_task(
+            self._index_procedure,
             procedure_id=proc_id,
             trigger=trigger,
             steps=procedure,
@@ -395,7 +411,7 @@ class ProceduralManager:
             List of matching ProceduralMemory
         """
         vector_results = self._find_procedure_vector(trigger, limit, min_score)
-        if vector_results is not None:
+        if vector_results:
             return vector_results
 
         procedures = []
@@ -410,6 +426,7 @@ class ProceduralManager:
 
         with self._get_connection() as conn:
             # Try FTS5 search first
+            rows = []
             try:
                 cursor = conn.execute(
                     """
@@ -423,7 +440,10 @@ class ProceduralManager:
                 )
                 rows = cursor.fetchall()
             except sqlite3.OperationalError:
-                # FTS5 might not have data yet, fallback to LIKE
+                rows = []
+
+            if not rows:
+                # FTS5 might not have indexed data yet, fallback to LIKE
                 cursor = conn.execute(
                     """
                     SELECT * FROM procedures
@@ -519,7 +539,7 @@ class ProceduralManager:
         if updated_row is None:
             return None
 
-        self._index_procedure_row(updated_row)
+        self._submit_vector_task(self._index_procedure_row, updated_row)
         return self._row_to_procedure(updated_row)
 
     def update_procedure(
@@ -603,7 +623,7 @@ class ProceduralManager:
         if updated_row is None:
             return None
 
-        self._index_procedure_row(updated_row)
+        self._submit_vector_task(self._index_procedure_row, updated_row)
         return self._row_to_procedure(updated_row)
 
     def get_decay_score(self, procedure_id: str) -> float:
@@ -680,7 +700,7 @@ class ProceduralManager:
             deleted = cursor.rowcount > 0
 
         if deleted:
-            self._delete_from_vector_store(procedure_id)
+            self._submit_vector_task(self._delete_from_vector_store, procedure_id)
 
         return deleted
 

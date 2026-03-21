@@ -48,6 +48,16 @@ _synapse_service = None
 _event_bus = None
 _graphiti_client = None
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Parse a boolean-ish environment variable."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in _TRUTHY
+
 
 def get_synapse_service():
     """Get SynapseService instance."""
@@ -80,91 +90,93 @@ async def init_services():
 
     # Try to initialize Graphiti for knowledge graph (optional)
     _graphiti_client = None
-    try:
-        from graphiti_core import Graphiti
-        from graphiti_core.driver.falkordb_driver import FalkorDriver
-        from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
-        from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
+    require_graphiti = _env_flag("SYNAPSE_REQUIRE_GRAPHITI", False)
+    enable_graphiti = _env_flag("SYNAPSE_ENABLE_GRAPHITI", True)
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 
-        # Get configuration from environment
-        falkor_host = os.getenv("FALKORDB_HOST", "localhost")
-        falkor_port = int(os.getenv("FALKORDB_PORT", "6379"))
-        falkor_password = os.getenv("FALKORDB_PASSWORD", "")
-        falkor_database = os.getenv("FALKORDB_DATABASE", "user-bfipa")
+    graphiti_skip_reason = None
+    if not enable_graphiti:
+        graphiti_skip_reason = "SYNAPSE_ENABLE_GRAPHITI=false"
+    elif not anthropic_api_key:
+        graphiti_skip_reason = "ANTHROPIC_API_KEY not set"
 
-        # LLM Configuration - use Anthropic via OpenAI-compatible endpoint (Z.ai)
-        anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-        anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    if graphiti_skip_reason:
+        message = f"Graphiti startup skipped: {graphiti_skip_reason}"
+        if require_graphiti:
+            raise RuntimeError(message)
+        print(f"[INFO] {message}")
+    else:
+        try:
+            from graphiti_core import Graphiti
+            from graphiti_core.driver.falkordb_driver import FalkorDriver
+            from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+            from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 
-        if not anthropic_api_key:
-            raise ValueError("ANTHROPIC_API_KEY not set")
+            # Get configuration from environment
+            falkor_host = os.getenv("FALKORDB_HOST", "localhost")
+            falkor_port = int(os.getenv("FALKORDB_PORT", "6379"))
+            falkor_password = os.getenv("FALKORDB_PASSWORD", "")
+            falkor_database = os.getenv("FALKORDB_DATABASE", "user-bfipa")
+            anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
 
-        # Create FalkorDB driver
-        print(f"[OK] Connecting to FalkorDB: {falkor_host}:{falkor_port}/{falkor_database}")
-        driver = FalkorDriver(
-            host=falkor_host,
-            port=falkor_port,
-            password=falkor_password if falkor_password else None,
-            database=falkor_database,  # Pass the database name!
-        )
+            # Create FalkorDB driver
+            print(f"[OK] Connecting to FalkorDB: {falkor_host}:{falkor_port}/{falkor_database}")
+            driver = FalkorDriver(
+                host=falkor_host,
+                port=falkor_port,
+                password=falkor_password if falkor_password else None,
+                database=falkor_database,
+            )
 
-        # Create LLM config using OpenAI-compatible endpoint (Z.ai wrapper for Anthropic)
-        llm_config = GraphitiLLMConfig(
-            api_key=anthropic_api_key,
-            base_url=anthropic_base_url,
-            model="claude-sonnet-4-20250514",  # Default model (Z.ai maps to GLM-4.7)
-        )
+            # Create LLM config using OpenAI-compatible endpoint (Z.ai wrapper for Anthropic)
+            llm_config = GraphitiLLMConfig(
+                api_key=anthropic_api_key,
+                base_url=anthropic_base_url,
+                model="claude-sonnet-4-20250514",
+            )
 
-        # Create LLM client using custom ZaiClient (Anthropic format)
-        from synapse.graphiti.llm_client.zai_client import ZaiClient
-        llm_client = ZaiClient(config=llm_config, max_tokens=4096)
-        print(f"[OK] LLM Client created (ZaiClient): {anthropic_base_url}")
+            from synapse.graphiti.llm_client.zai_client import ZaiClient
+            llm_client = ZaiClient(config=llm_config, max_tokens=4096)
+            print(f"[OK] LLM Client created (ZaiClient): {anthropic_base_url}")
 
-        # Create embedder - use local or OpenAI
-        embedder_provider = os.getenv("EMBEDDER_PROVIDER", "openai")
+            embedder_provider = os.getenv("EMBEDDER_PROVIDER", "openai")
 
-        if embedder_provider == "local":
-            # Use local embedder (no API key needed)
-            from synapse.graphiti.embedder.local import LocalEmbedder, LocalEmbedderConfig
-            embedder = LocalEmbedder(config=LocalEmbedderConfig(
-                embedding_dim=384,
-                model_name="intfloat/multilingual-e5-small",
-            ))
-            print("[OK] Using Local Embedder (sentence-transformers)")
-        else:
-            # Use OpenAI embedder (requires API key)
-            openai_api_key = os.getenv("OPENAI_API_KEY")
-            if not openai_api_key:
-                # Try to use Anthropic endpoint with OpenAI embedder (might not work)
-                print("[WARN] OPENAI_API_KEY not set, using Anthropic key (may fail)")
-                openai_api_key = anthropic_api_key
+            if embedder_provider == "local":
+                from synapse.graphiti.embedder.local import LocalEmbedder, LocalEmbedderConfig
+                embedder = LocalEmbedder(config=LocalEmbedderConfig(
+                    embedding_dim=384,
+                    model_name="intfloat/multilingual-e5-small",
+                ))
+                print("[OK] Using Local Embedder (sentence-transformers)")
+            else:
+                openai_api_key = os.getenv("OPENAI_API_KEY")
+                if not openai_api_key:
+                    print("[WARN] OPENAI_API_KEY not set, using Anthropic key (may fail)")
+                    openai_api_key = anthropic_api_key
 
-            embedder = OpenAIEmbedder(config=OpenAIEmbedderConfig(
-                api_key=openai_api_key,
-                embedding_model="text-embedding-3-small",
-                embedding_dim=1536,
-            ))
-            print("[OK] Using OpenAI Embedder")
+                embedder = OpenAIEmbedder(config=OpenAIEmbedderConfig(
+                    api_key=openai_api_key,
+                    embedding_model="text-embedding-3-small",
+                    embedding_dim=1536,
+                ))
+                print("[OK] Using OpenAI Embedder")
 
-        # Create Graphiti client
-        # Note: cross_encoder defaults to OpenAI if not provided, so we use mock
-        from synapse.graphiti.cross_encoder import MockCrossEncoderClient
-        cross_encoder = MockCrossEncoderClient()
-        print("[OK] Using Mock Cross Encoder (no API key needed)")
+            from synapse.graphiti.cross_encoder import MockCrossEncoderClient
+            cross_encoder = MockCrossEncoderClient()
+            print("[OK] Using Mock Cross Encoder (no API key needed)")
 
-        _graphiti_client = Graphiti(
-            graph_driver=driver,
-            llm_client=llm_client,
-            embedder=embedder,
-            cross_encoder=cross_encoder,
-        )
-        print("[OK] Graphiti client initialized (FalkorDB connected)")
+            _graphiti_client = Graphiti(
+                graph_driver=driver,
+                llm_client=llm_client,
+                embedder=embedder,
+                cross_encoder=cross_encoder,
+            )
+            print("[OK] Graphiti client initialized (FalkorDB connected)")
 
-    except Exception as e:
-        import traceback
-        print(f"[INFO] Graphiti not available: {e}")
-        print("      Knowledge graph features will return empty data")
-        _graphiti_client = None
+        except Exception as e:
+            print(f"[INFO] Graphiti not available: {e}")
+            print("      Knowledge graph features will return empty data")
+            _graphiti_client = None
 
     # Always initialize SynapseService with real LayerManager
     _synapse_service = SynapseService(

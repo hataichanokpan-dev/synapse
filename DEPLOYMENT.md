@@ -39,6 +39,8 @@ ANTHROPIC_BASE_URL=https://api.anthropic.com  # or custom endpoint
 
 # Optional
 SYNAPSE_REQUIRE_GRAPHITI=false  # Set to 'true' for fail-fast mode
+SYNAPSE_ENABLE_GRAPHITI=true    # Set to 'false' for SQLite-only / no-graph mode
+SYNAPSE_ENABLE_QDRANT=true      # Set to 'false' for SQLite-only / no-vector mode
 FALKORDB_URI=redis://localhost:6379
 FALKORDB_PASSWORD=
 ```

@@ -13,10 +13,17 @@ import math
 import os
 from typing import Any, Sequence
 
-# Default multilingual embedding model with good Thai support
 DEFAULT_EMBEDDING_MODEL = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
 
 _logger = logging.getLogger(__name__)
+_TRUTHY = {'1', 'true', 'yes', 'on'}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in _TRUTHY
 
 
 class QdrantClient:
@@ -29,6 +36,7 @@ class QdrantClient:
         embedding_model: str | None = None,
         vector_size: int = 384,
         prefer_grpc: bool = False,
+        timeout_seconds: float | None = None,
     ) -> None:
         env_vector_size = os.getenv('SYNAPSE_QDRANT_VECTOR_SIZE')
         if env_vector_size:
@@ -37,11 +45,23 @@ class QdrantClient:
             except ValueError:
                 pass
 
+        if timeout_seconds is None:
+            env_timeout = os.getenv('SYNAPSE_QDRANT_TIMEOUT_SECONDS')
+            if env_timeout:
+                try:
+                    timeout_seconds = float(env_timeout)
+                except ValueError:
+                    timeout_seconds = None
+        if timeout_seconds is None:
+            timeout_seconds = 5.0
+
         self.url = url or os.getenv('QDRANT_URL', 'http://localhost:6333')
         self.api_key = api_key or os.getenv('QDRANT_API_KEY')
         self.embedding_model = embedding_model or os.getenv('SYNAPSE_QDRANT_EMBEDDING_MODEL')
         self.vector_size = vector_size
         self.prefer_grpc = prefer_grpc
+        self.timeout_seconds = timeout_seconds
+        self.enabled = _env_flag('SYNAPSE_ENABLE_QDRANT', True)
 
         self._client: Any = None
         self._models: Any = None
@@ -56,6 +76,8 @@ class QdrantClient:
         recreate: bool = False,
     ) -> None:
         """Create a Qdrant collection if it does not already exist."""
+        if not self.enabled:
+            return
         client = self._ensure_client()
         size = vector_size or self.vector_size
 
@@ -83,6 +105,8 @@ class QdrantClient:
         wait: bool = True,
     ) -> None:
         """Upsert points into a collection."""
+        if not self.enabled:
+            return
         if not points:
             return
 
@@ -146,6 +170,8 @@ class QdrantClient:
         score_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
         """Search a collection using a text query or vector."""
+        if not self.enabled:
+            return []
         if not self._collection_exists(collection_name):
             return []
 
@@ -201,6 +227,8 @@ class QdrantClient:
         wait: bool = True,
     ) -> None:
         """Delete points by id or payload filter."""
+        if not self.enabled:
+            return
         if not ids and not filters:
             raise ValueError('ids or filters is required for Qdrant delete')
 
@@ -218,6 +246,8 @@ class QdrantClient:
 
     def _ensure_client(self) -> Any:
         """Lazily import and initialize the Qdrant SDK client."""
+        if not self.enabled:
+            raise RuntimeError('Qdrant is disabled by SYNAPSE_ENABLE_QDRANT=false')
         if self._client is not None:
             return self._client
 
@@ -234,6 +264,7 @@ class QdrantClient:
             url=self.url,
             api_key=self.api_key,
             prefer_grpc=self.prefer_grpc,
+            timeout=self.timeout_seconds,
         )
         return self._client
 
@@ -308,8 +339,9 @@ class QdrantClient:
     def _load_embedder(self) -> Any | None:
         """Load Sentence Transformers embedder.
 
-        Uses configured model if provided, otherwise falls back to default
-        multilingual model with Thai support.
+        Uses a configured model when provided. Otherwise falls back to the
+        deterministic hash embedder so core persistence never depends on a
+        heavy model download/load at runtime.
         """
         if self._embedder_loaded:
             return self._embedder
@@ -317,11 +349,13 @@ class QdrantClient:
         self._embedder_loaded = True
 
         model_name = (self.embedding_model or '').strip()
-        using_default = False
-
         if not model_name:
-            model_name = DEFAULT_EMBEDDING_MODEL
-            using_default = True
+            self._embedder = None
+            _logger.info(
+                "No embedding model configured. Using hash-based embeddings. "
+                "Set SYNAPSE_QDRANT_EMBEDDING_MODEL to enable a real embedding model."
+            )
+            return self._embedder
 
         try:
             from sentence_transformers import SentenceTransformer
@@ -330,13 +364,6 @@ class QdrantClient:
             dimension = self._embedder.get_sentence_embedding_dimension()
             if dimension:
                 self.vector_size = int(dimension)
-
-            if using_default:
-                _logger.warning(
-                    "No embedding model configured, using default: %s. "
-                    "Set SYNAPSE_QDRANT_EMBEDDING_MODEL env var for better performance.",
-                    DEFAULT_EMBEDDING_MODEL
-                )
         except Exception as exc:
             self._embedder = None
             _logger.warning(
