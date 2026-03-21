@@ -307,7 +307,9 @@ class QdrantClient:
         if preprocessor is None:
             return text.strip()
 
-        extraction = preprocessor.preprocess_for_extraction(text)
+        # Preserve raw proper nouns during indexing. Thai spellcheck is helpful for
+        # noisy prose, but it can rewrite names and nicknames into different words.
+        extraction = preprocessor.preprocess_for_extraction(text, spellcheck=False)
         tokens = preprocessor.tokenize_for_fts(extraction.processed)
 
         return ' '.join(part for part in [extraction.processed.strip(), tokens.strip()] if part)

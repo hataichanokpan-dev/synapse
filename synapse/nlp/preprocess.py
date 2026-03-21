@@ -76,6 +76,7 @@ class TextPreprocessor:
         self,
         text: str,
         aggressive: bool = False,
+        spellcheck: Optional[bool] = None,
     ) -> ExtractionPreprocessResult:
         """
         Preprocess text before entity extraction.
@@ -89,6 +90,7 @@ class TextPreprocessor:
         Args:
             text: Input text
             aggressive: Use aggressive normalization
+            spellcheck: Override Thai spellcheck behavior for this call
 
         Returns:
             ExtractionPreprocessResult with processed text
@@ -115,6 +117,7 @@ class TextPreprocessor:
         processed = text
         was_normalized = False
         was_spellchecked = False
+        should_spellcheck = self.spellcheck_thai if spellcheck is None else bool(spellcheck)
 
         # Process Thai content
         if thai_ratio > 0.1:  # Has Thai content
@@ -127,7 +130,7 @@ class TextPreprocessor:
                 was_normalized = True
 
             # Spellcheck if mostly Thai
-            if self.spellcheck_thai and language == "th":
+            if should_spellcheck and language == "th":
                 processed = ThaiSpellChecker.correct(processed)
                 was_spellchecked = True
 
@@ -246,6 +249,7 @@ def get_preprocessor() -> TextPreprocessor:
 def preprocess_for_extraction(
     text: str,
     aggressive: bool = False,
+    spellcheck: Optional[bool] = None,
 ) -> ExtractionPreprocessResult:
     """
     Preprocess text for entity extraction.
@@ -253,11 +257,16 @@ def preprocess_for_extraction(
     Args:
         text: Input text
         aggressive: Use aggressive normalization
+        spellcheck: Override Thai spellcheck behavior for this call
 
     Returns:
         ExtractionPreprocessResult
     """
-    return get_preprocessor().preprocess_for_extraction(text, aggressive)
+    return get_preprocessor().preprocess_for_extraction(
+        text,
+        aggressive=aggressive,
+        spellcheck=spellcheck,
+    )
 
 
 def preprocess_for_search(query: str) -> str:

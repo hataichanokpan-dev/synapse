@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
+from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 from graphiti_core.search.search_filters import SearchFilters
@@ -362,6 +363,43 @@ class GraphitiService:
         return self.client
 
 
+def _dedupe_group_ids(group_ids: list[str] | None) -> list[str]:
+    """Preserve order while removing duplicates/empty values."""
+    if not group_ids:
+        return []
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for group_id in group_ids:
+        if not group_id or group_id in seen:
+            continue
+        seen.add(group_id)
+        deduped.append(group_id)
+    return deduped
+
+
+def _resolve_graph_query_targets(client: Graphiti, group_ids: list[str] | None) -> list[tuple[Any, list[str]]]:
+    """Resolve Graph driver targets for direct MCP graph queries.
+
+    FalkorDB stores each group in its own database. In a fresh MCP process, the
+    client's default driver database may point at the configured default group,
+    so direct lookups for a different single group_id must clone the driver to
+    that group's database before querying.
+    """
+    driver = getattr(client, 'driver', None)
+    effective_group_ids = _dedupe_group_ids(group_ids)
+    if driver is None:
+        return []
+
+    if getattr(driver, 'provider', None) != GraphProvider.FALKORDB or not effective_group_ids:
+        return [(driver, effective_group_ids)]
+
+    return [
+        (driver.clone(database=group_id), [group_id])
+        for group_id in effective_group_ids
+    ]
+
+
 @mcp.tool()
 async def add_memory(
     name: str,
@@ -434,6 +472,7 @@ async def add_memory(
                 group_id=effective_group_id,
                 source=source,
                 uuid=uuid,
+                persist_graphiti=False,
             )
             detected_layer = result.get("layer", "unknown")
             logger.info(f"Memory '{name}' classified as layer: {detected_layer}")
@@ -511,15 +550,28 @@ async def search_nodes(
         # Use the search_ method with node search config
         from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
 
-        results = await client.search_(
-            query=query,
-            config=NODE_HYBRID_SEARCH_RRF,
-            group_ids=effective_group_ids,
-            search_filter=search_filters,
-        )
+        nodes = []
+        seen_node_ids: set[str] = set()
+        for driver, scoped_group_ids in _resolve_graph_query_targets(client, effective_group_ids):
+            results = await client.search_(
+                query=query,
+                config=NODE_HYBRID_SEARCH_RRF,
+                group_ids=scoped_group_ids,
+                search_filter=search_filters,
+                driver=driver,
+            )
 
-        # Extract nodes from results
-        nodes = results.nodes[:max_nodes] if results.nodes else []
+            for node in results.nodes or []:
+                node_uuid = getattr(node, 'uuid', None)
+                if node_uuid in seen_node_ids:
+                    continue
+                if node_uuid:
+                    seen_node_ids.add(node_uuid)
+                nodes.append(node)
+                if len(nodes) >= max_nodes:
+                    break
+            if len(nodes) >= max_nodes:
+                break
 
         if not nodes:
             return NodeSearchResponse(message='No relevant nodes found', nodes=[])
@@ -587,12 +639,26 @@ async def search_memory_facts(
             else []
         )
 
-        relevant_edges = await client.search(
-            group_ids=effective_group_ids,
-            query=query,
-            num_results=max_facts,
-            center_node_uuid=center_node_uuid,
-        )
+        relevant_edges = []
+        seen_edge_ids: set[str] = set()
+        for driver, scoped_group_ids in _resolve_graph_query_targets(client, effective_group_ids):
+            scoped_edges = await client.search(
+                group_ids=scoped_group_ids,
+                query=query,
+                num_results=max_facts,
+                center_node_uuid=center_node_uuid,
+                driver=driver,
+            )
+            for edge in scoped_edges:
+                edge_key = getattr(edge, 'uuid', None) or f"{getattr(edge, 'fact', '')}:{getattr(edge, 'source_node_uuid', '')}:{getattr(edge, 'target_node_uuid', '')}"
+                if edge_key in seen_edge_ids:
+                    continue
+                seen_edge_ids.add(edge_key)
+                relevant_edges.append(edge)
+                if len(relevant_edges) >= max_facts:
+                    break
+            if len(relevant_edges) >= max_facts:
+                break
 
         if not relevant_edges:
             return FactSearchResponse(message='No relevant facts found', facts=[])
@@ -1593,14 +1659,27 @@ async def get_episodes(
         # Get episodes from the driver directly
         from graphiti_core.nodes import EpisodicNode
 
-        if effective_group_ids:
-            episodes = await EpisodicNode.get_by_group_ids(
-                client.driver, effective_group_ids, limit=max_episodes
+        episodes = []
+        seen_episode_ids: set[str] = set()
+        for driver, scoped_group_ids in _resolve_graph_query_targets(client, effective_group_ids):
+            if not scoped_group_ids:
+                continue
+            scoped_episodes = await EpisodicNode.get_by_group_ids(
+                driver,
+                scoped_group_ids,
+                limit=max_episodes,
             )
-        else:
-            # If no group IDs, we need to use a different approach
-            # For now, return empty list when no group IDs specified
-            episodes = []
+            for episode in scoped_episodes:
+                episode_uuid = getattr(episode, 'uuid', None)
+                if episode_uuid in seen_episode_ids:
+                    continue
+                if episode_uuid:
+                    seen_episode_ids.add(episode_uuid)
+                episodes.append(episode)
+                if len(episodes) >= max_episodes:
+                    break
+            if len(episodes) >= max_episodes:
+                break
 
         if not episodes:
             return EpisodeSearchResponse(message='No episodes found', episodes=[])
@@ -1653,8 +1732,8 @@ async def clear_graph(group_ids: list[str] | None = None) -> SuccessResponse | E
         if not effective_group_ids:
             return ErrorResponse(error='No group IDs specified for clearing')
 
-        # Clear data for the specified group IDs
-        await clear_data(client.driver, group_ids=effective_group_ids)
+        for driver, scoped_group_ids in _resolve_graph_query_targets(client, effective_group_ids):
+            await clear_data(driver, group_ids=scoped_group_ids)
 
         return SuccessResponse(
             message=f'Graph data cleared successfully for group IDs: {", ".join(effective_group_ids)}'

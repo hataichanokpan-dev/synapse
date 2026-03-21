@@ -554,6 +554,7 @@ class SynapseService:
         layer: Optional[Any] = None,
         metadata: Optional[Dict[str, Any]] = None,
         agent_id: Optional[str] = None,
+        persist_graphiti: bool = True,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -604,7 +605,7 @@ class SynapseService:
 
         # Step 3: Store in Graphiti for knowledge graph (optional)
         graphiti_result = None
-        if self.graphiti is not None:
+        if persist_graphiti and self.graphiti is not None:
             try:
                 # Import EpisodeType for source conversion
                 from graphiti_core.nodes import EpisodeType

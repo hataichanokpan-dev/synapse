@@ -599,11 +599,16 @@ class SemanticManager:
         if preprocess:
             preprocessor = _get_nlp_preprocessor()
             if preprocessor:
-                result = preprocessor.preprocess_for_extraction(name)
+                # Preserve user-provided names/aliases exactly; Thai spellcheck can
+                # incorrectly rewrite proper nouns such as personal nicknames.
+                result = preprocessor.preprocess_for_extraction(name, spellcheck=False)
                 processed_name = result.processed
 
                 if summary:
-                    summary_result = preprocessor.preprocess_for_extraction(summary)
+                    summary_result = preprocessor.preprocess_for_extraction(
+                        summary,
+                        spellcheck=False,
+                    )
                     processed_summary = summary_result.processed
 
         node_id = str(uuid4())
