@@ -119,6 +119,8 @@ def test_memory_search_respects_layer_filter(client, api_headers):
     assert data["total"] >= 1
     assert all(result["layer"] == "PROCEDURAL" for result in data["results"])
     assert data["layers_searched"] == ["PROCEDURAL"]
+    assert data["mode_used"] == "hybrid_auto"
+    assert "lexical" in data["used_backends"]
 
 
 def test_memory_search_finds_new_episodic_items_by_query(client, api_headers):
@@ -146,6 +148,36 @@ def test_memory_search_finds_new_episodic_items_by_query(client, api_headers):
     assert data["total"] >= 1
     assert any(result["uuid"] == created["uuid"] for result in data["results"])
     assert all(result["layer"] == "EPISODIC" for result in data["results"])
+
+
+def test_memory_search_explain_and_strict_mode_paths(client, api_headers):
+    create_response = client.post(
+        "/api/memory/",
+        headers=api_headers,
+        json={
+            "name": "Semantic note",
+            "content": "Python is a programming language",
+            "layer": "SEMANTIC",
+        },
+    )
+    assert create_response.status_code == 200
+
+    explain_response = client.post(
+        "/api/memory/search",
+        headers=api_headers,
+        json={"query": "Python", "layers": ["SEMANTIC"], "explain": True},
+    )
+    assert explain_response.status_code == 200
+    explain_data = explain_response.json()
+    assert explain_data["results"]
+    assert explain_data["results"][0]["score_breakdown"] is not None
+
+    strict_response = client.post(
+        "/api/memory/search",
+        headers=api_headers,
+        json={"query": "Python", "layers": ["SEMANTIC"], "mode": "hybrid_strict"},
+    )
+    assert strict_response.status_code == 503
 
 
 def test_procedure_endpoints_return_real_ids_and_trigger(client, api_headers):
@@ -255,3 +287,18 @@ def test_system_maintenance_and_graph_unavailable_paths(client, api_headers):
 
     delete_edge = client.delete("/api/graph/edges/test-edge", headers=api_headers)
     assert delete_edge.status_code == 503
+
+
+def test_system_stats_include_search_metrics(client, api_headers):
+    search_response = client.post(
+        "/api/memory/search",
+        headers=api_headers,
+        json={"query": "nothing", "layers": ["PROCEDURAL"]},
+    )
+    assert search_response.status_code == 200
+
+    stats = client.get("/api/system/stats", headers=api_headers)
+    assert stats.status_code == 200
+    body = stats.json()
+    assert "search" in body
+    assert "counts" in body["search"]

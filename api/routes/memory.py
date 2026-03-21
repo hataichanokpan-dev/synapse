@@ -29,6 +29,7 @@ from api.models import (
     SuccessResponse,
     MemoryLayer,
 )
+from synapse.search import HybridSearchError
 
 router = APIRouter(tags=["Memory"])
 
@@ -145,68 +146,102 @@ async def search_memories(
             if layer is not None:
                 layers.append(layer.value)
 
-    result = await service.search_memory(
-        query=request.query,
-        layers=layers,
-        limit=request.limit,
-    )
+    try:
+        result = await service.search_memory(
+            query=request.query,
+            layers=layers,
+            limit=request.limit,
+            mode=request.mode.value,
+            query_type=request.query_type.value,
+            explain=request.explain,
+        )
+    except HybridSearchError as exc:
+        raise HTTPException(status_code=503, detail={"message": str(exc), "degraded_backends": exc.degraded_backends})
 
-    # Flatten layer results into a single list
-    results = []
-    for layer_name, layer_items in result.get("layers", {}).items():
-        for item in (layer_items if isinstance(layer_items, list) else []):
-            # Items may be dicts or model objects - handle both
-            if isinstance(item, dict):
-                uid = item.get("uuid", item.get("id", ""))
-                name = item.get("name", item.get("trigger", ""))
-                content = item.get("content", item.get("episode_body", ""))
-                if not content:
-                    steps = item.get("steps") or item.get("procedure")
-                    if isinstance(steps, list):
-                        content = "\n".join(str(step) for step in steps)
-                score = item.get("score", 1.0)
-                highlight = item.get("highlight")
-                metadata = item.get("metadata", {})
-            else:
-                uid = str(getattr(item, 'uuid', getattr(item, 'id', '')))
-                name = getattr(item, 'name', getattr(item, 'trigger', ''))
-                content = getattr(item, 'content', getattr(item, 'episode_body', ''))
-                if hasattr(item, 'procedure') and not content:
-                    steps = getattr(item, "procedure")
-                    content = "\n".join(str(step) for step in steps) if isinstance(steps, list) else str(steps)
-                score = getattr(item, 'score', 1.0)
-                highlight = None
-                metadata = {}
+    parsed_results: list[MemorySearchResult] = []
+    ranked_results = result.get("results") or result.get("ranked_results") or []
+    if ranked_results:
+        for item in ranked_results:
+            layer_enum = parse_api_memory_layer(item.get("layer")) or MemoryLayer.EPISODIC
+            parsed_results.append(
+                MemorySearchResult(
+                    uuid=str(item.get("uuid", "")),
+                    layer=layer_enum,
+                    name=str(item.get("name", "")),
+                    content=str(item.get("content", "")),
+                    score=float(item.get("score", 1.0)),
+                    highlight=item.get("highlight"),
+                    metadata=item.get("metadata", {}) if isinstance(item.get("metadata"), dict) else {},
+                    sources=item.get("sources"),
+                    score_breakdown=item.get("score_breakdown"),
+                    match_reasons=item.get("match_reasons"),
+                    path=item.get("path"),
+                    degraded_backends=item.get("degraded_backends"),
+                )
+            )
+    else:
+        # Legacy flattening path
+        for layer_name, layer_items in result.get("layers", {}).items():
+            for item in (layer_items if isinstance(layer_items, list) else []):
+                if isinstance(item, dict):
+                    uid = item.get("uuid", item.get("id", ""))
+                    name = item.get("name", item.get("trigger", ""))
+                    content = item.get("content", item.get("episode_body", ""))
+                    if not content:
+                        steps = item.get("steps") or item.get("procedure")
+                        if isinstance(steps, list):
+                            content = "\n".join(str(step) for step in steps)
+                    score = item.get("score", 1.0)
+                    highlight = item.get("highlight")
+                    metadata = item.get("metadata", {})
+                else:
+                    uid = str(getattr(item, "uuid", getattr(item, "id", "")))
+                    name = getattr(item, "name", getattr(item, "trigger", ""))
+                    content = getattr(item, "content", getattr(item, "episode_body", ""))
+                    if hasattr(item, "procedure") and not content:
+                        steps = getattr(item, "procedure")
+                        content = "\n".join(str(step) for step in steps) if isinstance(steps, list) else str(steps)
+                    score = getattr(item, "score", 1.0)
+                    highlight = None
+                    metadata = {}
 
-            layer_enum = parse_api_memory_layer(layer_name) or MemoryLayer.EPISODIC
+                layer_enum = parse_api_memory_layer(layer_name) or MemoryLayer.EPISODIC
+                parsed_results.append(
+                    MemorySearchResult(
+                        uuid=str(uid),
+                        layer=layer_enum,
+                        name=str(name),
+                        content=str(content) if content else "",
+                        score=float(score) if score else 1.0,
+                        highlight=highlight,
+                        metadata=metadata if isinstance(metadata, dict) else {},
+                    )
+                )
 
-            results.append(MemorySearchResult(
-                uuid=str(uid),
-                layer=layer_enum,
-                name=str(name),
-                content=str(content) if content else "",
-                score=float(score) if score else 1.0,
-                highlight=highlight,
-                metadata=metadata if isinstance(metadata, dict) else {},
-            ))
-
-    # Add Graphiti (semantic graph) results
-    for item in result.get("graphiti", []):
-        fact = getattr(item, 'fact', None) or getattr(item, 'name', str(item))
-        results.append(MemorySearchResult(
-            uuid=getattr(item, 'uuid', ""),
-            layer=MemoryLayer.SEMANTIC,
-            name=getattr(item, 'name', fact[:50] if isinstance(fact, str) else ""),
-            content=fact if isinstance(fact, str) else str(fact),
-            score=getattr(item, 'score', 1.0),
-            metadata={},
-        ))
+        for item in result.get("graphiti", []):
+            fact = getattr(item, "fact", None) or getattr(item, "name", str(item))
+            parsed_results.append(
+                MemorySearchResult(
+                    uuid=getattr(item, "uuid", ""),
+                    layer=MemoryLayer.SEMANTIC,
+                    name=getattr(item, "name", fact[:50] if isinstance(fact, str) else ""),
+                    content=fact if isinstance(fact, str) else str(fact),
+                    score=getattr(item, "score", 1.0),
+                    metadata={},
+                )
+            )
 
     return MemorySearchResponse(
-        results=results,
-        total=len(results),
+        results=parsed_results,
+        total=len(parsed_results),
         query=request.query,
         layers_searched=[parse_api_memory_layer(layer).value for layer in layers] if layers else ["all"],
+        mode_used=result.get("mode_used"),
+        query_type_detected=result.get("query_type_detected"),
+        used_backends=list(result.get("used_backends", [])),
+        degraded=bool(result.get("degraded", False)),
+        warnings=list(result.get("warnings", [])),
+        pinned_context=list(result.get("pinned_context", [])),
     )
 
 

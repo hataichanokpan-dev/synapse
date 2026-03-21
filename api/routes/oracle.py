@@ -22,6 +22,7 @@ from api.models import (
     AnalyzeResponse,
     MemoryLayer,
 )
+from synapse.search import HybridSearchError
 
 router = APIRouter(tags=["Oracle"])
 
@@ -40,11 +41,19 @@ async def consult(
             if normalized is not None:
                 layers.append(normalized.value)
 
-    result = await service.consult(
-        query=request.query,
-        layers=layers,
-        limit=request.limit,
-    )
+    try:
+        result = await service.consult(
+            query=request.query,
+            layers=layers,
+            limit=request.limit,
+            mode=request.mode.value,
+            query_type=request.query_type.value,
+            explain=request.explain,
+        )
+    except HybridSearchError as exc:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=503, detail={"message": str(exc), "degraded_backends": exc.degraded_backends})
 
     # Parse layer summaries - service returns {layer_name: [items]}
     layer_summaries = {}
@@ -79,11 +88,37 @@ async def consult(
         else:
             summary_texts.append(str(s))
 
+    ranked_results = []
+    for item in result.get("ranked_results", []):
+        layer_enum = parse_api_memory_layer(item.get("layer")) or MemoryLayer.EPISODIC
+        ranked_results.append(
+            {
+                "uuid": str(item.get("uuid", "")),
+                "layer": layer_enum,
+                "name": str(item.get("name", "")),
+                "content": str(item.get("content", "")),
+                "score": float(item.get("score", 1.0)),
+                "metadata": item.get("metadata", {}) if isinstance(item.get("metadata"), dict) else {},
+                "sources": item.get("sources"),
+                "score_breakdown": item.get("score_breakdown"),
+                "match_reasons": item.get("match_reasons"),
+                "path": item.get("path"),
+                "degraded_backends": item.get("degraded_backends"),
+            }
+        )
+
     return ConsultResponse(
         query=request.query,
         layers=layer_summaries,
         summary=summary_texts,
         suggestions=result.get("suggestions", []),
+        ranked_results=ranked_results,
+        mode_used=result.get("mode_used"),
+        query_type_detected=result.get("query_type_detected"),
+        used_backends=list(result.get("used_backends", [])),
+        degraded=bool(result.get("degraded", False)),
+        warnings=list(result.get("warnings", [])),
+        pinned_context=list(result.get("pinned_context", [])),
     )
 
 

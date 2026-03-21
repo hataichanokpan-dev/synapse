@@ -6,8 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from synapse.layers import EntityType
-from synapse.layers.semantic import SemanticManager
+from synapse.search import HybridSearchError
 
 
 @pytest.mark.asyncio
@@ -95,18 +94,37 @@ async def test_search_memory_normalizes_layer_filters(synapse_service):
     assert "episodic" not in result["layers"]
 
 
-class RejectingVectorClient:
-    def upsert(self, *args, **kwargs):
-        raise RuntimeError("vector write failed")
+@pytest.mark.asyncio
+async def test_search_memory_returns_hybrid_metadata_and_pinned_context(synapse_service):
+    synapse_service.set_working_context("current_task", "deploy release candidate")
+    synapse_service.layers.procedural.learn_procedure(
+        trigger="Deploy release",
+        procedure=["Run tests", "Ship release"],
+        topics=["deploy"],
+    )
+
+    result = await synapse_service.search_memory("deploy", limit=5, explain=True)
+    assert result["mode_used"] == "hybrid_auto"
+    assert result["query_type_detected"] in {
+        "exact",
+        "semantic",
+        "relational",
+        "procedural",
+        "episodic",
+        "preference",
+        "mixed",
+    }
+    assert result["results"]
+    assert any(entry["sources"] for entry in result["results"])
+    assert result["pinned_context"]
 
 
 @pytest.mark.asyncio
-async def test_semantic_add_requires_a_durable_backend():
-    manager = SemanticManager(graphiti_client=None, vector_client=RejectingVectorClient())
-
-    with pytest.raises(RuntimeError, match="no durable backend accepted the write"):
-        await manager.add_entity(
-            name="Python",
-            entity_type=EntityType.CONCEPT,
-            summary="A programming language",
+async def test_hybrid_strict_requires_semantic_graph_backend(synapse_service):
+    with pytest.raises(HybridSearchError):
+        await synapse_service.search_memory(
+            "python",
+            layers=["SEMANTIC"],
+            limit=5,
+            mode="hybrid_strict",
         )

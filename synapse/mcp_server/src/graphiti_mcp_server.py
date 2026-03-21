@@ -650,6 +650,7 @@ async def search_memory_layers(
             query=query,
             layers=layer_enums,
             limit=limit,
+            mode='hybrid_auto',
         )
 
         return {
@@ -664,6 +665,15 @@ async def search_memory_layers(
                 }
                 for edge in results["graphiti"]
             ] if results["graphiti"] else [],
+            "ranked_results": results.get("ranked_results"),
+            "hybrid_meta": {
+                "mode_used": results.get("mode_used"),
+                "query_type_detected": results.get("query_type_detected"),
+                "used_backends": results.get("used_backends", []),
+                "degraded": results.get("degraded", False),
+                "warnings": results.get("warnings", []),
+                "pinned_context": results.get("pinned_context", []),
+            },
         }
     except Exception as e:
         error_msg = str(e)
@@ -1287,11 +1297,20 @@ async def synapse_consult(
             query=query,
             layers=layers,
             limit=limit,
+            mode='hybrid_auto',
         )
 
         return {
             "message": f"Consultation complete for: {query}",
             **result,
+            "hybrid_meta": {
+                "mode_used": result.get("mode_used"),
+                "query_type_detected": result.get("query_type_detected"),
+                "used_backends": result.get("used_backends", []),
+                "degraded": result.get("degraded", False),
+                "warnings": result.get("warnings", []),
+                "pinned_context": result.get("pinned_context", []),
+            },
         }
     except Exception as e:
         error_msg = str(e)

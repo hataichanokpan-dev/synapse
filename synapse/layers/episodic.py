@@ -343,6 +343,178 @@ class EpisodicManager:
 
         return episodes
 
+    def _tokenize_for_search(self, text: str, preprocess: bool = True) -> str:
+        """Tokenize text for Thai-aware lexical search."""
+        if not preprocess or not text:
+            return text
+        preprocessor = _get_nlp_preprocessor()
+        if preprocessor:
+            return preprocessor.tokenize_for_fts(text)
+        return text
+
+    @staticmethod
+    def _term_overlap(query_text: str, indexed_text: str) -> float:
+        """Compute normalized token overlap."""
+        query_terms = {term for term in str(query_text).split() if term}
+        indexed_terms = {term for term in str(indexed_text).split() if term}
+        if not query_terms or not indexed_terms:
+            return 0.0
+        return len(query_terms.intersection(indexed_terms)) / max(1, len(query_terms))
+
+    def fetch_lexical_candidates(
+        self,
+        query: str,
+        limit: int = 20,
+        user_id: Optional[str] = None,
+        preprocess: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Return lexical episodic candidates for hybrid search."""
+        now = utcnow()
+        search_query = self._tokenize_for_search(query, preprocess=preprocess)
+        rows = []
+        with self._get_connection() as conn:
+            try:
+                sql = """
+                    SELECT e.*, bm25(episodes_fts) AS fts_rank
+                    FROM episodes e
+                    JOIN episodes_fts ON e.rowid = episodes_fts.rowid
+                    WHERE episodes_fts MATCH ?
+                      AND (e.expires_at IS NULL OR e.expires_at > ?)
+                """
+                params: List[Any] = [search_query, now.isoformat()]
+                if user_id:
+                    sql += " AND e.user_id = ?"
+                    params.append(user_id)
+                sql += " ORDER BY fts_rank ASC, e.recorded_at DESC LIMIT ?"
+                params.append(limit)
+                cursor = conn.execute(sql, params)
+                rows = cursor.fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+
+            if not rows:
+                sql = """
+                    SELECT *, 0.0 AS fts_rank
+                    FROM episodes
+                    WHERE (content LIKE ? OR summary LIKE ?)
+                      AND (expires_at IS NULL OR expires_at > ?)
+                """
+                params = [f"%{query}%", f"%{query}%", now.isoformat()]
+                if user_id:
+                    sql += " AND user_id = ?"
+                    params.append(user_id)
+                sql += " ORDER BY recorded_at DESC LIMIT ?"
+                params.append(limit)
+                cursor = conn.execute(sql, params)
+                rows = cursor.fetchall()
+
+        candidates: List[Dict[str, Any]] = []
+        for rank, row in enumerate(rows, start=1):
+            episode = self._row_to_episode(row)
+            indexed_text = " ".join(
+                part for part in [row["summary_fts"] or "", row["content_fts"] or ""] if part
+            ).strip() or self._tokenize_for_search(f"{episode.summary or ''} {episode.content}", preprocess=preprocess)
+            overlap = self._term_overlap(search_query, indexed_text)
+            exact_match = query.lower() in (episode.summary or "").lower() or query.lower() in episode.content.lower()
+            age_days = max(0.0, (now - episode.recorded_at).total_seconds() / 86400.0)
+            freshness = max(0.0, min(1.0, 1.0 - (age_days / 180.0)))
+            candidates.append(
+                {
+                    "record_id": episode.id,
+                    "layer": MemoryLayer.EPISODIC,
+                    "backend": "lexical",
+                    "backend_score": min(1.0, 0.65 * overlap + 0.35 * (1.0 if exact_match else 0.0)),
+                    "rank": rank,
+                    "exact_match": exact_match,
+                    "matched_terms": [query] if exact_match else search_query.split(),
+                    "match_reasons": ["fts" if row["content_fts"] or row["summary_fts"] else "like"],
+                    "freshness": freshness,
+                    "usage_signal": min(1.0, episode.access_count / 10.0),
+                    "payload": {
+                        "uuid": episode.id,
+                        "layer": MemoryLayer.EPISODIC.value,
+                        "name": episode.summary or episode.content[:80],
+                        "content": episode.content,
+                        "metadata": {
+                            "summary": episode.summary,
+                            "topics": episode.topics,
+                            "outcome": episode.outcome,
+                            "recorded_at": episode.recorded_at.isoformat() if episode.recorded_at else None,
+                        },
+                        "source": "episodic",
+                        "indexed_text": indexed_text,
+                    },
+                }
+            )
+        return candidates
+
+    def fetch_vector_candidates(
+        self,
+        query: str,
+        limit: int = 20,
+        user_id: Optional[str] = None,
+        embedding_cache: Any = None,
+    ) -> List[Dict[str, Any]]:
+        """Return vector episodic candidates for hybrid search."""
+        filters: Dict[str, Any] = {}
+        if user_id:
+            filters["user_id"] = user_id
+        try:
+            results = self.vector_client.search(
+                collection_name=self.collection_name,
+                query_text=query,
+                limit=max(limit, 1),
+                filters=filters or None,
+            )
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+            return []
+
+        rows_by_id = self._get_episode_rows([result["id"] for result in results])
+        now = utcnow()
+        candidates: List[Dict[str, Any]] = []
+        for rank, result in enumerate(results, start=1):
+            row = rows_by_id.get(str(result["id"]))
+            if row is None:
+                continue
+            episode = self._row_to_episode(row)
+            if episode.expires_at and episode.expires_at <= now:
+                continue
+            age_days = max(0.0, (now - episode.recorded_at).total_seconds() / 86400.0)
+            freshness = max(0.0, min(1.0, 1.0 - (age_days / 180.0)))
+            indexed_text = " ".join(
+                part for part in [row["summary_fts"] or "", row["content_fts"] or ""] if part
+            ).strip() or episode.content
+            candidates.append(
+                {
+                    "record_id": episode.id,
+                    "layer": MemoryLayer.EPISODIC,
+                    "backend": "vector",
+                    "backend_score": max(0.0, min(1.0, float(result.get("score", 0.0)))),
+                    "rank": rank,
+                    "exact_match": query.lower() in (episode.summary or "").lower() or query.lower() in episode.content.lower(),
+                    "matched_terms": query.split(),
+                    "match_reasons": ["vector_similarity"],
+                    "freshness": freshness,
+                    "usage_signal": min(1.0, episode.access_count / 10.0),
+                    "payload": {
+                        "uuid": episode.id,
+                        "layer": MemoryLayer.EPISODIC.value,
+                        "name": episode.summary or episode.content[:80],
+                        "content": episode.content,
+                        "metadata": {
+                            "summary": episode.summary,
+                            "topics": episode.topics,
+                            "outcome": episode.outcome,
+                            "recorded_at": episode.recorded_at.isoformat() if episode.recorded_at else None,
+                        },
+                        "source": "episodic",
+                        "indexed_text": indexed_text,
+                    },
+                }
+            )
+        return candidates
+
     def record_episode(
         self,
         content: str,

@@ -192,6 +192,9 @@ class SmokeRunner:
         self.check_preferences_round_trip()
         self.check_episodic_memory_flow()
         self.check_procedure_flow()
+        self.check_hybrid_search_flow()
+        self.check_oracle_consult_flow()
+        self.check_search_stats()
         self.check_feed_history()
         self.check_feed_stream()
 
@@ -479,6 +482,115 @@ class SmokeRunner:
             payload.get("success_count", 0) >= 1 and payload.get("trigger") == self.updated_procedure_trigger,
             status,
             f"payload={payload}",
+            started_at,
+        )
+
+    def check_hybrid_search_flow(self) -> None:
+        started_at = time.time()
+        status, payload = self.client.request(
+            "POST",
+            "/api/memory/search",
+            body={
+                "query": self.token,
+                "limit": 10,
+                "mode": "hybrid_auto",
+                "query_type": "mixed",
+                "explain": True,
+            },
+        )
+        self.assert_status("hybrid_search_http", 200, status, payload, started_at)
+        results = payload.get("results", [])
+        result_ids = {item.get("uuid") for item in results if isinstance(item, dict)}
+        self.assert_condition(
+            "hybrid_search_body",
+            (
+                bool(results)
+                and (self.created_memory_id in result_ids or self.created_procedure_id in result_ids)
+                and payload.get("mode_used") == "hybrid_auto"
+                and bool(payload.get("query_type_detected"))
+                and "lexical" in payload.get("used_backends", [])
+            ),
+            status,
+            f"payload={payload}",
+            started_at,
+        )
+        self.assert_condition(
+            "hybrid_search_explain",
+            any(item.get("sources") for item in results if isinstance(item, dict)),
+            status,
+            f"results={results}",
+            started_at,
+        )
+
+        started_at = time.time()
+        status, payload = self.client.request(
+            "POST",
+            "/api/memory/search",
+            body={
+                "query": self.token,
+                "layers": ["SEMANTIC"],
+                "limit": 5,
+                "mode": "hybrid_strict",
+            },
+        )
+        detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        strict_ok = status in {200, 503}
+        if strict_ok and status == 503 and isinstance(detail, dict):
+            strict_ok = bool(detail.get("degraded_backends"))
+        self.assert_condition(
+            "hybrid_strict_semantic",
+            strict_ok,
+            status,
+            f"payload={payload}",
+            started_at,
+        )
+
+    def check_oracle_consult_flow(self) -> None:
+        started_at = time.time()
+        status, payload = self.client.request(
+            "POST",
+            "/api/oracle/consult",
+            body={
+                "query": self.token,
+                "limit": 5,
+                "mode": "hybrid_auto",
+                "query_type": "mixed",
+                "explain": True,
+            },
+        )
+        self.assert_status("consult_http", 200, status, payload, started_at)
+        ranked_results = payload.get("ranked_results", [])
+        self.assert_condition(
+            "consult_body",
+            (
+                bool(ranked_results)
+                and payload.get("mode_used") == "hybrid_auto"
+                and bool(payload.get("query_type_detected"))
+                and bool(payload.get("summary"))
+            ),
+            status,
+            f"payload={payload}",
+            started_at,
+        )
+        self.assert_condition(
+            "consult_explain",
+            any(item.get("sources") for item in ranked_results if isinstance(item, dict)),
+            status,
+            f"ranked_results={ranked_results}",
+            started_at,
+        )
+
+    def check_search_stats(self) -> None:
+        started_at = time.time()
+        status, payload = self.client.request("GET", "/api/system/stats")
+        self.assert_status("system_stats_search_http", 200, status, payload, started_at)
+        search = payload.get("search", {}) if isinstance(payload, dict) else {}
+        counts = search.get("counts", {}) if isinstance(search, dict) else {}
+        self.assert_condition(
+            "system_stats_search_body",
+            int(counts.get("queries_total", 0)) >= 2,
+            status,
+            f"search={search}",
             started_at,
         )
 

@@ -21,6 +21,7 @@ from api.models import (
     StatsResponse,
     StorageStats,
     MemoryStats,
+    SearchStats,
     MaintenanceRequest,
     MaintenanceResponse,
     MaintenanceResult,
@@ -124,6 +125,11 @@ async def get_stats(service=Depends(get_synapse_service)):
             falkordb_mb=storage_data.get("falkordb_mb", 0.0),
             qdrant_mb=storage_data.get("qdrant_mb", 0.0),
             sqlite_mb=storage_data.get("sqlite_mb", 0.0),
+        ),
+        search=SearchStats(
+            counts=result.get("search", {}).get("counts", {}),
+            latency_ms=result.get("search", {}).get("latency_ms", {}),
+            semantic_projection=result.get("semantic_projection", {}),
         ),
     )
 

@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import uuid
 from pathlib import Path
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -305,6 +305,158 @@ class ProceduralManager:
                 break
 
         return procedures
+
+    def _tokenize_for_search(self, text: str, preprocess: bool = True) -> str:
+        """Tokenize search text for Thai-aware FTS."""
+        if not preprocess or not text:
+            return text
+        preprocessor = _get_nlp_preprocessor()
+        if preprocessor:
+            return preprocessor.tokenize_for_fts(text)
+        return text
+
+    @staticmethod
+    def _term_overlap(query_text: str, indexed_text: str) -> float:
+        """Compute normalized token overlap."""
+        query_terms = {term for term in str(query_text).split() if term}
+        indexed_terms = {term for term in str(indexed_text).split() if term}
+        if not query_terms or not indexed_terms:
+            return 0.0
+        return len(query_terms.intersection(indexed_terms)) / max(1, len(query_terms))
+
+    def fetch_lexical_candidates(
+        self,
+        query: str,
+        limit: int = 20,
+        preprocess: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Return lexical candidates for hybrid search."""
+        search_query = self._tokenize_for_search(query, preprocess=preprocess)
+        rows = []
+        with self._get_connection() as conn:
+            try:
+                cursor = conn.execute(
+                    """
+                    SELECT p.*, bm25(procedures_fts) AS fts_rank
+                    FROM procedures p
+                    JOIN procedures_fts ON p.rowid = procedures_fts.rowid
+                    WHERE procedures_fts MATCH ?
+                    ORDER BY fts_rank ASC, p.success_count DESC
+                    LIMIT ?
+                    """,
+                    (search_query, limit),
+                )
+                rows = cursor.fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+
+            if not rows:
+                cursor = conn.execute(
+                    """
+                    SELECT *, 0.0 AS fts_rank
+                    FROM procedures
+                    WHERE trigger LIKE ?
+                    ORDER BY success_count DESC, updated_at DESC
+                    LIMIT ?
+                    """,
+                    (f"%{query}%", limit),
+                )
+                rows = cursor.fetchall()
+
+        candidates: List[Dict[str, Any]] = []
+        for rank, row in enumerate(rows, start=1):
+            procedure = self._row_to_procedure(row)
+            indexed_text = row["trigger_fts"] or self._tokenize_for_search(procedure.trigger, preprocess=preprocess)
+            overlap = self._term_overlap(search_query, indexed_text)
+            exact_match = query.lower() in procedure.trigger.lower()
+            backend_score = min(1.0, 0.65 * overlap + 0.35 * (1.0 if exact_match else 0.0))
+            candidates.append(
+                {
+                    "record_id": procedure.id,
+                    "layer": MemoryLayer.PROCEDURAL,
+                    "backend": "lexical",
+                    "backend_score": backend_score,
+                    "rank": rank,
+                    "exact_match": exact_match,
+                    "matched_terms": [query] if exact_match else search_query.split(),
+                    "match_reasons": ["fts" if row["trigger_fts"] else "like"],
+                    "freshness": max(0.0, min(1.0, float(procedure.decay_score))),
+                    "usage_signal": min(1.0, procedure.success_count / 10.0),
+                    "payload": {
+                        "uuid": procedure.id,
+                        "layer": MemoryLayer.PROCEDURAL.value,
+                        "name": procedure.trigger,
+                        "content": "\n".join(procedure.procedure),
+                        "metadata": {
+                            "trigger": procedure.trigger,
+                            "steps": procedure.procedure,
+                            "topics": procedure.topics,
+                        },
+                        "source": procedure.source,
+                        "indexed_text": indexed_text,
+                    },
+                }
+            )
+        return candidates
+
+    def fetch_vector_candidates(
+        self,
+        query: str,
+        limit: int = 20,
+        min_score: float = 0.0,
+        embedding_cache: Any = None,
+    ) -> List[Dict[str, Any]]:
+        """Return vector candidates for hybrid search."""
+        try:
+            results = self.vector_client.search(
+                collection_name=self.collection_name,
+                query_text=query,
+                limit=max(limit, 1),
+            )
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+            return []
+
+        rows_by_id = self._get_procedure_rows([result["id"] for result in results])
+        candidates: List[Dict[str, Any]] = []
+        for rank, result in enumerate(results, start=1):
+            procedure_id = str(result["id"])
+            row = rows_by_id.get(procedure_id)
+            if row is None:
+                continue
+            procedure = self._row_to_procedure(row)
+            backend_score = max(0.0, min(1.0, float(result.get("score", 0.0))))
+            if backend_score < min_score:
+                continue
+            indexed_text = row["trigger_fts"] or procedure.trigger
+            candidates.append(
+                {
+                    "record_id": procedure.id,
+                    "layer": MemoryLayer.PROCEDURAL,
+                    "backend": "vector",
+                    "backend_score": backend_score,
+                    "rank": rank,
+                    "exact_match": query.lower() in procedure.trigger.lower(),
+                    "matched_terms": query.split(),
+                    "match_reasons": ["vector_similarity"],
+                    "freshness": max(0.0, min(1.0, float(procedure.decay_score))),
+                    "usage_signal": min(1.0, procedure.success_count / 10.0),
+                    "payload": {
+                        "uuid": procedure.id,
+                        "layer": MemoryLayer.PROCEDURAL.value,
+                        "name": procedure.trigger,
+                        "content": "\n".join(procedure.procedure),
+                        "metadata": {
+                            "trigger": procedure.trigger,
+                            "steps": procedure.procedure,
+                            "topics": procedure.topics,
+                        },
+                        "source": procedure.source,
+                        "indexed_text": indexed_text,
+                    },
+                }
+            )
+        return candidates
 
     def learn_procedure(
         self,

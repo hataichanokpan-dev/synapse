@@ -15,9 +15,13 @@ This layer wraps Graphiti's functionality with:
 - Thai NLP preprocessing for better extraction
 """
 
+import asyncio
+import json
 import os
 import logging
 import re
+import threading
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from uuid import uuid4
@@ -39,6 +43,7 @@ from .types import (
     utcnow,
 )
 from .decay import compute_decay_score, should_forget
+from .semantic_store import SemanticProjectionStore, DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
 DEFAULT_COLLECTION_NAME = "semantic_memory"
@@ -46,6 +51,11 @@ DEFAULT_COLLECTION_NAME = "semantic_memory"
 # Environment variable to require Graphiti in production
 # When true, Graphiti write failures will raise exceptions instead of silent warnings
 _REQUIRE_GRAPHITI = os.environ.get("SYNAPSE_REQUIRE_GRAPHITI", "false").lower() == "true"
+
+
+def _graphiti_enabled() -> bool:
+    """Read Graphiti enablement dynamically for tests and local safe mode."""
+    return os.environ.get("SYNAPSE_ENABLE_GRAPHITI", "true").lower() in {"1", "true", "yes", "on"}
 
 # Lazy import for Thai NLP
 _nlp_preprocessor = None
@@ -84,6 +94,7 @@ class SemanticManager:
         graphiti_client=None,
         vector_client: Optional[QdrantClient] = None,
         collection_name: str = DEFAULT_COLLECTION_NAME,
+        db_path: Optional[Path] = None,
     ):
         """
         Initialize Semantic Memory Manager.
@@ -96,9 +107,17 @@ class SemanticManager:
         self.collection_name = collection_name
         self._initialized = False
         self._vector_warning_emitted = False
+        self.store = SemanticProjectionStore(db_path or DEFAULT_DB_PATH)
+        self._outbox_threads: Dict[str, threading.Thread] = {}
+        try:
+            self._app_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._app_loop = None
 
     async def _ensure_graphiti(self, require: bool = False) -> bool:
         """Ensure Graphiti client is initialized when available."""
+        if not _graphiti_enabled() and not require and not _REQUIRE_GRAPHITI:
+            return False
         if self._graphiti is None:
             try:
                 from graphiti_core import Graphiti
@@ -165,6 +184,112 @@ class SemanticManager:
 
         logger.warning("Semantic memory Qdrant integration unavailable: %s", exc)
         self._vector_warning_emitted = True
+
+    def _queue_outbox(self, target_backend: str, record_id: str, op_type: str, payload: Dict[str, Any]) -> None:
+        """Enqueue a derived write and kick the worker."""
+        operation_id = str(uuid4())
+        dedupe_key = f"{op_type}:{record_id}:{target_backend}"
+        self.store.enqueue_outbox(
+            operation_id=operation_id,
+            target_backend=target_backend,
+            record_id=record_id,
+            op_type=op_type,
+            payload=payload,
+            dedupe_key=dedupe_key,
+        )
+        self._submit_outbox_worker(target_backend)
+
+    def _submit_outbox_worker(self, target_backend: str) -> None:
+        """Start a best-effort outbox worker for a backend."""
+        thread = self._outbox_threads.get(target_backend)
+        if thread is not None and thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=self._drain_outbox_backend,
+            args=(target_backend,),
+            daemon=True,
+            name=f"semantic-outbox-{target_backend}",
+        )
+        self._outbox_threads[target_backend] = thread
+        thread.start()
+
+    def _drain_outbox_backend(self, target_backend: str) -> None:
+        """Best-effort outbox worker."""
+        rows = self.store.fetch_pending_outbox(target_backend=target_backend, limit=20)
+        for row in rows:
+            operation_id = row["operation_id"]
+            retry_count = int(row["retry_count"] or 0)
+            payload = json.loads(row["payload_json"] or "{}")
+            try:
+                if target_backend == "vector":
+                    self._apply_vector_payload(payload)
+                elif target_backend == "graph":
+                    self._apply_graph_payload(payload)
+                else:
+                    continue
+                self.store.mark_outbox_success(operation_id)
+            except Exception as exc:
+                if target_backend == "vector":
+                    self._warn_vector_issue(exc)
+                else:
+                    logger.warning("Semantic graph outbox failure: %s", exc)
+                self.store.mark_outbox_failure(operation_id, str(exc), retry_count + 1)
+
+    def _apply_vector_payload(self, payload: Dict[str, Any]) -> None:
+        """Apply a vector outbox payload."""
+        node = SynapseNode(
+            id=str(payload["id"]),
+            type=EntityType(str(payload["entity_type"])),
+            name=str(payload["name"]),
+            summary=payload.get("summary"),
+            memory_layer=MemoryLayer(str(payload.get("memory_layer", MemoryLayer.SEMANTIC.value))),
+            confidence=float(payload.get("confidence", 0.7)),
+            decay_score=float(payload.get("decay_score", 1.0)),
+            access_count=int(payload.get("access_count", 0)),
+            created_at=self._parse_datetime(payload.get("created_at")) or utcnow(),
+            updated_at=self._parse_datetime(payload.get("updated_at")) or utcnow(),
+            source_episode=payload.get("source_episode"),
+            created_by=str(payload.get("created_by", "synapse")),
+        )
+        self._index_entity(node)
+
+    def _apply_graph_payload(self, payload: Dict[str, Any]) -> None:
+        """Apply a graph outbox payload."""
+        if payload.get("op_type") == "add_entity":
+            self._run_graph_coroutine(
+                self._persist_graphiti_episode(
+                    name=str(payload.get("graph_name") or f"entity_{payload.get('name', 'semantic')}"),
+                    episode_body=str(payload.get("episode_body") or ""),
+                    source_description=str(payload.get("source_description") or "Entity"),
+                    reference_time=self._parse_datetime(payload.get("created_at")) or utcnow(),
+                )
+            )
+        elif payload.get("op_type") == "add_fact":
+            self._run_graph_coroutine(
+                self._persist_graphiti_episode(
+                    name=str(payload.get("graph_name") or f"fact_{payload.get('id', 'semantic')}"),
+                    episode_body=str(payload.get("episode_body") or ""),
+                    source_description=str(payload.get("source_description") or "Fact"),
+                    reference_time=self._parse_datetime(payload.get("valid_at")) or utcnow(),
+                )
+            )
+
+    def _run_graph_coroutine(self, coro: Any) -> None:
+        """Run Graphiti work on the app loop when available."""
+        app_loop = self._app_loop
+        if app_loop is not None and not app_loop.is_closed():
+            future = asyncio.run_coroutine_threadsafe(coro, app_loop)
+            future.result(timeout=60)
+            return
+
+        try:
+            asyncio.run(coro)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(coro)
+            finally:
+                loop.close()
 
     async def _persist_graphiti_episode(
         self,
@@ -259,6 +384,186 @@ class SemanticManager:
         except ValueError:
             return None
 
+    def fetch_lexical_candidates(
+        self,
+        query: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Fetch lexical semantic candidates from SQLite projection."""
+        return self.store.fetch_lexical_candidates(query=query, limit=limit)
+
+    def fetch_vector_candidates(
+        self,
+        query: str,
+        limit: int = 20,
+        embedding_cache: Any = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch vector semantic candidates from Qdrant."""
+        try:
+            results = self.vector_client.search(
+                collection_name=self.collection_name,
+                query_text=query,
+                limit=max(limit, 1),
+            )
+        except Exception as exc:
+            self._warn_vector_issue(exc)
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+        for rank, result in enumerate(results, start=1):
+            node = self._payload_to_node(result.get("payload") or {})
+            if node is None:
+                node = self.store.get_node(str(result.get("id")))
+            if node is None:
+                continue
+            indexed_text = self.store.fetch_lexical_candidates(node.name, limit=1)
+            payload = {
+                "uuid": node.id,
+                "layer": MemoryLayer.SEMANTIC.value,
+                "name": node.name,
+                "content": node.summary or "",
+                "metadata": {
+                    "entity_type": node.type.value if hasattr(node.type, "value") else node.type,
+                    "confidence": node.confidence,
+                    "source_episode": node.source_episode,
+                },
+                "source": "semantic",
+                "indexed_text": indexed_text[0]["payload"]["indexed_text"] if indexed_text else f"{node.name} {node.summary or ''}",
+            }
+            candidates.append(
+                {
+                    "record_id": node.id,
+                    "layer": MemoryLayer.SEMANTIC,
+                    "backend": "vector",
+                    "backend_score": max(0.0, min(1.0, float(result.get("score", 0.0)))),
+                    "rank": rank,
+                    "exact_match": query.lower() in node.name.lower() or query.lower() in (node.summary or "").lower(),
+                    "matched_terms": query.split(),
+                    "match_reasons": ["vector_similarity"],
+                    "freshness": max(0.0, min(1.0, node.decay_score)),
+                    "usage_signal": min(1.0, node.access_count / 10.0),
+                    "payload": payload,
+                }
+            )
+        return candidates
+
+    async def fetch_graph_candidates(
+        self,
+        query: str,
+        limit: int = 15,
+        *,
+        seed_ids: Optional[List[str]] = None,
+        query_type: str = "mixed",
+    ) -> List[Dict[str, Any]]:
+        """Fetch graph-derived semantic candidates."""
+        driver = getattr(self._graphiti, "driver", None) or getattr(self._graphiti, "_driver", None)
+        if driver is None:
+            return []
+
+        seed_ids = [seed_id for seed_id in (seed_ids or []) if seed_id]
+        records = []
+        if seed_ids:
+            try:
+                records, _, _ = await driver.execute_query(
+                    """
+                    MATCH (n)-[e]-(m)
+                    WHERE n.uuid IN $seed_ids OR m.uuid IN $seed_ids
+                    RETURN COALESCE(e.uuid, n.uuid, m.uuid) AS uuid,
+                           COALESCE(e.fact, e.name, '') AS fact,
+                           COALESCE(e.name, 'RELATED_TO') AS relation,
+                           n.uuid AS source_id,
+                           m.uuid AS target_id,
+                           COALESCE(n.name, n.uuid) AS source_name,
+                           COALESCE(m.name, m.uuid) AS target_name,
+                           COALESCE(e.created_at, n.created_at, m.created_at) AS created_at
+                    LIMIT $limit
+                    """,
+                    seed_ids=seed_ids,
+                    limit=limit,
+                )
+            except Exception as exc:
+                logger.debug("Seeded graph fetch failed: %s", exc)
+                records = []
+
+        if not records and self._graphiti is not None:
+            try:
+                graph_results = await self._graphiti.search(query=query, num_results=limit)
+            except Exception as exc:
+                logger.debug("Graphiti search failed: %s", exc)
+                graph_results = []
+
+            converted: List[Dict[str, Any]] = []
+            for rank, edge in enumerate(graph_results, start=1):
+                fact = getattr(edge, "fact", "") or str(edge)
+                source_id = getattr(edge, "source_node_uuid", None)
+                target_id = getattr(edge, "target_node_uuid", None)
+                converted.append(
+                    {
+                        "record_id": str(getattr(edge, "uuid", f"graph:{rank}:{source_id}:{target_id}")),
+                        "layer": MemoryLayer.SEMANTIC,
+                        "backend": "graph",
+                        "backend_score": 1.0,
+                        "rank": rank,
+                        "exact_match": query.lower() in fact.lower(),
+                        "matched_terms": query.split(),
+                        "match_reasons": ["graph_search"],
+                        "freshness": 1.0,
+                        "usage_signal": 0.5,
+                        "path": [str(source_id or "source"), fact[:80], str(target_id or "target")],
+                        "payload": {
+                            "uuid": str(getattr(edge, "uuid", f"graph:{rank}")),
+                            "layer": MemoryLayer.SEMANTIC.value,
+                            "name": fact[:80] or "Graph fact",
+                            "content": fact,
+                            "metadata": {
+                                "source_id": source_id,
+                                "target_id": target_id,
+                            },
+                            "source": "graph",
+                            "indexed_text": fact,
+                        },
+                    }
+                )
+            return converted
+
+        results: List[Dict[str, Any]] = []
+        relational_boost = 1.0 if query_type == "relational" else 0.6
+        for rank, record in enumerate(records, start=1):
+            fact = record.get("fact") or f"{record.get('source_name')} {record.get('relation')} {record.get('target_name')}"
+            results.append(
+                {
+                    "record_id": str(record.get("uuid") or f"graph:{rank}"),
+                    "layer": MemoryLayer.SEMANTIC,
+                    "backend": "graph",
+                    "backend_score": min(1.0, relational_boost),
+                    "rank": rank,
+                    "exact_match": query.lower() in fact.lower(),
+                    "matched_terms": query.split(),
+                    "match_reasons": ["graph_neighbors"],
+                    "freshness": 1.0,
+                    "usage_signal": 0.5,
+                    "path": [str(record.get("source_name")), str(record.get("relation")), str(record.get("target_name"))],
+                    "payload": {
+                        "uuid": str(record.get("uuid") or f"graph:{rank}"),
+                        "layer": MemoryLayer.SEMANTIC.value,
+                        "name": fact[:80] or "Graph fact",
+                        "content": fact,
+                        "metadata": {
+                            "source_id": record.get("source_id"),
+                            "target_id": record.get("target_id"),
+                            "relation": record.get("relation"),
+                        },
+                        "source": "graph",
+                        "indexed_text": fact,
+                    },
+                }
+            )
+        return results
+
+    def get_outbox_health(self) -> Dict[str, Dict[str, Any]]:
+        """Expose semantic outbox health for system stats."""
+        return self.store.get_outbox_health()
+
     async def add_entity(
         self,
         name: str,
@@ -317,32 +622,36 @@ class SemanticManager:
             source_episode=source_episode,
         )
 
-        # Index to Qdrant (existing)
-        qdrant_persisted = self._index_entity(node)
+        self.store.save_node(node)
 
-        # Persist to Graphiti/FalkorDB
-        graph_persisted = False
-        if self._graphiti is not None:
-            try:
-                # Use add_episode to let LLM extract entity
-                episode_content = f"{processed_name}: {processed_summary or ''}"
-                await self._persist_graphiti_episode(
-                    name=f"entity_{processed_name}",
-                    episode_body=episode_content,
-                    source_description=f"Entity type: {entity_type.value}",
-                    reference_time=now,
-                )
-                logger.debug(f"Entity '{processed_name}' persisted to Graphiti")
-                graph_persisted = True
-            except Exception as e:
-                self._handle_graphiti_error("add_entity", e, processed_name)
-        elif _REQUIRE_GRAPHITI:
-            raise GraphitiNotInitializedError("add_entity")
+        vector_payload = {
+            "id": node.id,
+            "entity_type": entity_type.value if hasattr(entity_type, "value") else str(entity_type),
+            "name": node.name,
+            "summary": node.summary,
+            "memory_layer": node.memory_layer.value if hasattr(node.memory_layer, "value") else str(node.memory_layer),
+            "confidence": node.confidence,
+            "decay_score": node.decay_score,
+            "access_count": node.access_count,
+            "created_at": node.created_at.isoformat(),
+            "updated_at": node.updated_at.isoformat(),
+            "source_episode": node.source_episode,
+            "created_by": node.created_by,
+        }
+        if getattr(self.vector_client, "enabled", True):
+            self._queue_outbox("vector", node.id, "add_entity", vector_payload)
 
-        if not qdrant_persisted and not graph_persisted:
-            raise RuntimeError(
-                "Semantic memory persistence failed: no durable backend accepted the write"
-            )
+        if self._graphiti is not None or _REQUIRE_GRAPHITI:
+            graph_payload = {
+                "id": node.id,
+                "op_type": "add_entity",
+                "name": node.name,
+                "graph_name": f"entity_{processed_name}",
+                "episode_body": f"{processed_name}: {processed_summary or ''}",
+                "source_description": f"Entity type: {entity_type.value}",
+                "created_at": now.isoformat(),
+            }
+            self._queue_outbox("graph", node.id, "add_entity", graph_payload)
 
         return node
 
@@ -388,24 +697,18 @@ class SemanticManager:
             metadata=metadata or {},
         )
 
-        # Persist to Graphiti/FalkorDB
-        if self._graphiti is not None:
-            try:
-                # Use add_episode to let LLM extract relationship
-                episode_content = f"{source_id} {relation_type.value} {target_id}"
-                if metadata:
-                    episode_content += f" | {metadata}"
-                await self._persist_graphiti_episode(
-                    name=f"fact_{edge_id}",
-                    episode_body=episode_content,
-                    source_description=f"Fact: {relation_type.value}",
-                    reference_time=now,
-                )
-                logger.debug(f"Fact '{edge_id}' persisted to Graphiti")
-            except Exception as e:
-                self._handle_graphiti_error("add_fact", e, edge_id)
-        elif _REQUIRE_GRAPHITI:
-            raise GraphitiNotInitializedError("add_fact")
+        fact_text = f"{source_id} {relation_type.value} {target_id}"
+        self.store.save_edge(edge, fact_text=fact_text)
+        if self._graphiti is not None or _REQUIRE_GRAPHITI:
+            graph_payload = {
+                "id": edge.id,
+                "op_type": "add_fact",
+                "graph_name": f"fact_{edge_id}",
+                "episode_body": f"{fact_text} | {metadata or {}}",
+                "source_description": f"Fact: {relation_type.value}",
+                "valid_at": (valid_at or now).isoformat(),
+            }
+            self._queue_outbox("graph", edge.id, "add_fact", graph_payload)
 
         return edge
 
@@ -433,48 +736,38 @@ class SemanticManager:
             List of SearchResult
         """
         now = utcnow()
-        filters: Dict[str, Any] = {}
-
-        if entity_types:
-            filters["entity_type"] = [entity_type.value for entity_type in entity_types]
-
-        try:
-            matches = self.vector_client.search(
-                collection_name=self.collection_name,
-                query_text=query,
-                limit=max(limit * 3, limit),
-                filters=filters or None,
-            )
-        except Exception as exc:
-            self._warn_vector_issue(exc)
-            return []
+        candidates = self.fetch_vector_candidates(query=query, limit=max(limit * 2, limit))
+        if use_hybrid:
+            lexical = self.fetch_lexical_candidates(query=query, limit=max(limit * 2, limit))
+            by_id = {candidate["record_id"]: candidate for candidate in candidates}
+            for item in lexical:
+                existing = by_id.get(item["record_id"])
+                if existing is None:
+                    by_id[item["record_id"]] = item
+                else:
+                    existing["backend_score"] = max(existing["backend_score"], item["backend_score"])
+            candidates = list(by_id.values())
 
         results = []
-
-        for match in matches:
-            node = self._payload_to_node(match["payload"])
+        for candidate in candidates[:limit]:
+            node = self.store.get_node(candidate["record_id"])
             if node is None:
                 continue
-
+            if entity_types and node.type not in entity_types:
+                continue
             decay_score = self.compute_decay_score(node, now)
-            vector_score = max(0.0, min(1.0, float(match.get("score", 0.0))))
-            combined_score = max(0.0, min(1.0, (vector_score + decay_score) / 2.0))
-
+            combined_score = max(0.0, min(1.0, (float(candidate["backend_score"]) + decay_score) / 2.0))
             if combined_score < min_score:
                 continue
-
             results.append(
                 SearchResult(
                     node=node,
                     score=combined_score,
-                    source="vector",
+                    source=str(candidate["backend"]),
+                    path=candidate.get("path"),
                 )
             )
-
-            if len(results) >= limit:
-                break
-
-        return results
+        return results[:limit]
 
     async def get_entity(self, entity_id: str) -> Optional[SynapseNode]:
         """
@@ -490,7 +783,10 @@ class SemanticManager:
         """
         await self._ensure_graphiti()
 
-        # First try to get from Qdrant vector store
+        node = self.store.get_node(entity_id)
+        if node is not None:
+            return node
+
         try:
             matches = self.vector_client.search(
                 collection_name=self.collection_name,
@@ -500,10 +796,6 @@ class SemanticManager:
             if matches:
                 node = self._payload_to_node(matches[0]["payload"])
                 if node and node.id == entity_id:
-                    # Increment access count
-                    node.access_count += 1
-                    node.updated_at = utcnow()
-                    self._index_entity(node)  # Update in Qdrant
                     return node
         except Exception as exc:
             self._warn_vector_issue(exc)

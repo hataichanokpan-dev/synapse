@@ -7,6 +7,7 @@ the 5-layer memory system while maintaining Graphiti compatibility.
 
 import json
 import logging
+import os
 import re
 from datetime import datetime as dt
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from synapse.layers import (
     SynapseEdge,
     SearchResult,
 )
+from synapse.search import HybridSearchEngine, SearchMode
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +238,12 @@ def _sanitize_graph_group_ids(group_ids: Optional[List[str]]) -> Optional[List[s
     return [_sanitize_graph_group_id(group_id) for group_id in group_ids]
 
 
+def _default_search_mode() -> str:
+    """Resolve the runtime default hybrid search mode."""
+    raw = os.getenv("SYNAPSE_SEARCH_ENGINE", SearchMode.HYBRID_AUTO.value).strip().lower()
+    return raw if raw in {mode.value for mode in SearchMode} else SearchMode.HYBRID_AUTO.value
+
+
 class SynapseService:
     """
     Unified service for Synapse memory operations.
@@ -267,9 +275,13 @@ class SynapseService:
         """
         self.graphiti = graphiti_client
         self.layers = layer_manager or LayerManager()
+        semantic_manager = getattr(self.layers, "semantic", None)
+        if semantic_manager is not None and getattr(semantic_manager, "_graphiti", None) is None:
+            setattr(semantic_manager, "_graphiti", graphiti_client)
         self.user_id = user_id
         self.agent_id = agent_id
         self.chat_id = chat_id
+        self.hybrid_search = HybridSearchEngine(self.layers, self.graphiti)
 
     def _serialize_episode_memory(
         self,
@@ -436,6 +448,19 @@ class SynapseService:
             )
         raise ValueError(f"Unsupported memory layer: {layer}")
 
+    def _bump_search_generations(self, *layers: Any) -> None:
+        """Invalidate hybrid-search generations for affected layers."""
+        generation_keys: List[str] = []
+        for layer in layers:
+            normalized = _normalize_core_layer(layer)
+            if normalized is None:
+                continue
+            generation_keys.append(normalized.value)
+            if normalized == MemoryLayer.SEMANTIC:
+                generation_keys.extend(["semantic_lexical", "semantic_graph"])
+        if generation_keys:
+            self.hybrid_search.bump_generations(*generation_keys)
+
     # ============================================
     # IDENTITY MANAGEMENT
     # ============================================
@@ -575,6 +600,7 @@ class SynapseService:
             source=source,
             source_description=source_description,
         )
+        self._bump_search_generations(detected_layer)
 
         # Step 3: Store in Graphiti for knowledge graph (optional)
         graphiti_result = None
@@ -696,6 +722,9 @@ class SynapseService:
         query: str,
         layers: Optional[List[MemoryLayer]] = None,
         limit: int = 10,
+        mode: Optional[str] = None,
+        query_type: str = "auto",
+        explain: bool = False,
     ) -> Dict[str, Any]:
         """
         Search across memory layers.
@@ -709,29 +738,53 @@ class SynapseService:
             Dict with results per layer and Graphiti results
         """
         normalized_layers = _normalize_core_layers(layers)
+        resolved_mode = str(mode or _default_search_mode()).strip().lower()
+        if resolved_mode == SearchMode.LEGACY.value:
+            return await self._search_memory_legacy(query=query, layers=normalized_layers, limit=limit)
 
-        # Search layers
-        layer_results = await self.layers.search_all(
+        return await self.hybrid_search.search(
             query=query,
             layers=normalized_layers,
+            limit=limit,
+            mode=resolved_mode,
+            query_type=query_type,
+            explain=explain,
+            user_id=self.user_id,
+            group_id=self.chat_id,
+        )
+
+    async def _search_memory_legacy(
+        self,
+        *,
+        query: str,
+        layers: Optional[List[MemoryLayer]],
+        limit: int,
+    ) -> Dict[str, Any]:
+        """Existing search behavior retained for compatibility/debugging."""
+        layer_results = await self.layers.search_all(
+            query=query,
+            layers=layers,
             limit_per_layer=limit,
             user_id=self.user_id,
         )
-
-        # Search Graphiti (optional)
         graphiti_results = []
         if self.graphiti is not None:
             try:
-                graphiti_results = await self.graphiti.search(
-                    query=query,
-                    num_results=limit,
-                )
+                graphiti_results = await self.graphiti.search(query=query, num_results=limit)
             except Exception as e:
                 logger.error(f"Graphiti search failed: {e}")
 
         return {
+            "results": [],
             "layers": {k.value if hasattr(k, 'value') else str(k): v for k, v in layer_results.items()},
             "graphiti": graphiti_results,
+            "mode_used": SearchMode.LEGACY.value,
+            "query_type_detected": None,
+            "used_backends": ["legacy"],
+            "degraded": False,
+            "warnings": [],
+            "pinned_context": [],
+            "degraded_backends": [],
         }
 
     # ============================================
@@ -752,12 +805,14 @@ class SynapseService:
         except ValueError:
             et = EntityType.CONCEPT
 
-        return await self.layers.add_entity(
+        entity = await self.layers.add_entity(
             name=name,
             entity_type=et,
             summary=summary,
             **kwargs,
         )
+        self._bump_search_generations(MemoryLayer.SEMANTIC)
+        return entity
 
     async def get_entity(self, entity_id: str) -> Optional[SynapseNode]:
         """Get entity from semantic layer."""
@@ -1003,6 +1058,7 @@ class SynapseService:
 
         # Perform update
         self.layers.update_user(uid, **kwargs)
+        self._bump_search_generations(MemoryLayer.USER_MODEL)
 
         # Return updated context
         return self.get_user_context()
@@ -1039,6 +1095,7 @@ class SynapseService:
         result["steps"] = list(procedure.procedure)
         result["topics"] = list(procedure.topics or [])
         result["success_count"] = procedure.success_count
+        self._bump_search_generations(MemoryLayer.PROCEDURAL)
         return result
 
     def record_procedure_success(self, procedure_id: str) -> Optional[Dict[str, Any]]:
@@ -1061,6 +1118,7 @@ class SynapseService:
         result["trigger"] = procedure.trigger
         result["success_count"] = procedure.success_count
         result["last_used"] = procedure.last_used.isoformat() if procedure.last_used else None
+        self._bump_search_generations(MemoryLayer.PROCEDURAL)
         return result
 
     def get_all_working_context(self) -> Dict[str, Any]:
@@ -1107,6 +1165,7 @@ class SynapseService:
     def set_working_context(self, key: str, value: Any) -> None:
         """Set working memory value."""
         self.layers.set_working(key, value)
+        self._bump_search_generations(MemoryLayer.WORKING)
 
     def get_working_context(self, key: str, default: Any = None) -> Any:
         """Get working memory value."""
@@ -1114,7 +1173,9 @@ class SynapseService:
 
     def clear_working_context(self) -> int:
         """Clear working memory."""
-        return self.layers.clear_working()
+        cleared = self.layers.clear_working()
+        self._bump_search_generations(MemoryLayer.WORKING)
+        return cleared
 
     # ============================================
     # ORACLE TOOLS (Gap 3)
@@ -1125,6 +1186,9 @@ class SynapseService:
         query: str,
         layers: Optional[List[str]] = None,
         limit: int = 5,
+        mode: Optional[str] = None,
+        query_type: str = "auto",
+        explain: bool = False,
     ) -> Dict[str, Any]:
         """
         Consult memory layers for guidance on a query.
@@ -1142,25 +1206,55 @@ class SynapseService:
             Dict with guidance from each layer, ranked by relevance
         """
         target_layers = _normalize_core_layers(layers)
+        resolved_mode = str(mode or _default_search_mode()).strip().lower()
+        if resolved_mode == SearchMode.LEGACY.value:
+            results = await self.layers.search_all(
+                query=query,
+                layers=target_layers,
+                limit_per_layer=limit,
+                user_id=self.user_id,
+            )
+            ranked_results = []
+            layers_payload = {layer.value if hasattr(layer, "value") else str(layer): items for layer, items in results.items()}
+            degraded = False
+            warnings: List[str] = []
+            pinned_context: List[Dict[str, Any]] = []
+            query_type_detected = None
+            used_backends = ["legacy"]
+        else:
+            hybrid = await self.hybrid_search.search(
+                query=query,
+                layers=target_layers,
+                limit=limit,
+                mode=resolved_mode,
+                query_type=query_type,
+                explain=explain,
+                user_id=self.user_id,
+                group_id=self.chat_id,
+            )
+            ranked_results = hybrid.get("results", [])
+            layers_payload = hybrid.get("layers", {})
+            degraded = bool(hybrid.get("degraded"))
+            warnings = list(hybrid.get("warnings", []))
+            pinned_context = list(hybrid.get("pinned_context", []))
+            query_type_detected = str(hybrid.get("query_type_detected", "mixed"))
+            used_backends = list(hybrid.get("used_backends", []))
 
-        # Search all specified layers
-        results = await self.layers.search_all(
-            query=query,
-            layers=target_layers,
-            limit_per_layer=limit,
-            user_id=self.user_id,
-        )
-
-        # Format results for each layer
         guidance = {
             "query": query,
             "identity": self.get_identity(),
             "layers": {},
             "summary": [],
+            "ranked_results": ranked_results,
+            "mode_used": resolved_mode,
+            "query_type_detected": query_type_detected,
+            "used_backends": used_backends,
+            "degraded": degraded,
+            "warnings": warnings,
+            "pinned_context": pinned_context,
         }
 
-        for layer, items in results.items():
-            layer_name = layer.value if hasattr(layer, 'value') else str(layer)
+        for layer_name, items in layers_payload.items():
             guidance["layers"][layer_name] = items
 
             # Add to summary if results found
@@ -1509,6 +1603,7 @@ class SynapseService:
                 outcome=metadata.get("outcome"),
             )
             if updated:
+                self._bump_search_generations(MemoryLayer.EPISODIC)
                 return self._serialize_episode_memory(updated)
             return None
 
@@ -1535,6 +1630,7 @@ class SynapseService:
                 topics=topics,
             )
             if updated:
+                self._bump_search_generations(MemoryLayer.PROCEDURAL)
                 return self._serialize_procedure_memory(updated)
             return None
 
@@ -1552,10 +1648,12 @@ class SynapseService:
         """
         # Try episodic layer
         if self.layers.episodic.delete_episode(memory_id):
+            self._bump_search_generations(MemoryLayer.EPISODIC)
             return {"message": f"Memory {memory_id} deleted from episodic layer"}
 
         # Try procedural layer
         if self.layers.procedural.delete_procedure(memory_id):
+            self._bump_search_generations(MemoryLayer.PROCEDURAL)
             return {"message": f"Memory {memory_id} deleted from procedural layer"}
 
         return {"message": f"Memory {memory_id} not found"}
@@ -1655,6 +1753,7 @@ class SynapseService:
                         entity_type=EntityType.CONCEPT,
                         summary=ep.summary or ep.content[:200],
                     )
+                    self._bump_search_generations(MemoryLayer.SEMANTIC)
 
                     results["promoted"].append({
                         "id": ep.id,
@@ -1909,58 +2008,50 @@ class SynapseService:
 
         try:
             if query:
-                # Use Graphiti search to find edges, then extract unique node UUIDs
-                search_results = await self.graphiti.search(query=query, num_results=limit)
-                node_uuids = set()
-                for edge in search_results:
-                    node_uuids.add(edge.source_node_uuid)
-                    node_uuids.add(edge.target_node_uuid)
-
-                if not node_uuids:
-                    return {"nodes": [], "total": 0}
-
-                uuid_list = list(node_uuids)
+                query_lower = query.lower()
                 records, _, _ = await driver.execute_query(
                     """
                     MATCH (n)
-                    WHERE n.uuid IN $uuids
+                    WHERE n.uuid IS NOT NULL
+                      AND (
+                        (n.name IS NOT NULL AND toLower(n.name) CONTAINS $query_lower)
+                        OR (n.summary IS NOT NULL AND toLower(n.summary) CONTAINS $query_lower)
+                      )
                     RETURN n.uuid AS uuid, n.name AS name, n.summary AS summary,
                            n.created_at AS created_at, labels(n) AS labels
+                    ORDER BY CASE
+                        WHEN n.name IS NOT NULL AND toLower(n.name) CONTAINS $query_lower THEN 0
+                        ELSE 1
+                    END, n.created_at DESC
                     LIMIT $limit
                     """,
-                    uuids=uuid_list,
+                    query_lower=query_lower,
                     limit=limit,
                 )
 
-                # Filter results by query relevance to name/summary
-                query_lower = query.lower()
-                filtered_records = []
-                for record in records:
-                    name = (record.get("name") or "").lower()
-                    summary = (record.get("summary") or "").lower()
+                if not records and self.graphiti is not None:
+                    # Fall back to Graphiti edge search when direct node lookup has no hit.
+                    search_results = await self.graphiti.search(query=query, num_results=limit)
+                    node_uuids = set()
+                    for edge in search_results:
+                        node_uuids.add(edge.source_node_uuid)
+                        node_uuids.add(edge.target_node_uuid)
 
-                    # Prioritize name matches, then summary matches
-                    if query_lower in name:
-                        filtered_records.insert(0, record)  # Name matches go first
-                    elif query_lower in summary:
-                        filtered_records.append(record)
+                    if not node_uuids:
+                        return {"nodes": [], "total": 0}
 
-                # If filtering removed all results, use fuzzy match on name
-                if not filtered_records:
-                    # Try partial matching on name
-                    for record in records:
-                        name = (record.get("name") or "").lower()
-                        # Match any word in query
-                        if any(word in name for word in query_lower.split() if len(word) > 2):
-                            filtered_records.append(record)
-
-                # If still no results, return limited original results
-                if not filtered_records:
-                    filtered_records = records[:limit]
-                else:
-                    filtered_records = filtered_records[:limit]
-
-                records = filtered_records
+                    uuid_list = list(node_uuids)
+                    records, _, _ = await driver.execute_query(
+                        """
+                        MATCH (n)
+                        WHERE n.uuid IN $uuids
+                        RETURN n.uuid AS uuid, n.name AS name, n.summary AS summary,
+                               n.created_at AS created_at, labels(n) AS labels
+                        LIMIT $limit
+                        """,
+                        uuids=uuid_list,
+                        limit=limit,
+                    )
             else:
                 # List all entity nodes (use any label, not just :Entity)
                 records, _, _ = await driver.execute_query(
@@ -2640,12 +2731,14 @@ class SynapseService:
             topics=topics,
         )
         if updated:
+            self._bump_search_generations(MemoryLayer.PROCEDURAL)
             return await self.get_procedure_by_id(procedure_id)
         return None
 
     async def delete_procedure(self, procedure_id: str) -> Dict[str, Any]:
         """Delete a procedure."""
         if self.layers.procedural.delete_procedure(procedure_id):
+            self._bump_search_generations(MemoryLayer.PROCEDURAL)
             return {"message": f"Procedure {procedure_id} deleted"}
         return {"message": f"Procedure {procedure_id} not found"}
 
@@ -2691,6 +2784,16 @@ class SynapseService:
             components["procedural_db"] = "ok"
         except Exception as e:
             components["procedural_db"] = f"error: {e}"
+            overall_status = "degraded"
+
+        try:
+            outbox = self.layers.semantic.get_outbox_health()
+            unhealthy = [backend for backend, info in outbox.items() if info.get("unhealthy")]
+            components["hybrid_search"] = "ok" if not unhealthy else f"degraded: {', '.join(unhealthy)}"
+            if unhealthy:
+                overall_status = "degraded"
+        except Exception as e:
+            components["hybrid_search"] = f"error: {e}"
             overall_status = "degraded"
 
         return {
@@ -2753,6 +2856,9 @@ class SynapseService:
                 except OSError:
                     pass
 
+        hybrid_metrics = self.hybrid_search.snapshot_metrics()
+        semantic_stats = self.layers.semantic.store.get_stats() if hasattr(self.layers.semantic, "store") else {}
+
         return {
             "entities": entity_count,
             "edges": edge_count,
@@ -2765,6 +2871,8 @@ class SynapseService:
                 "qdrant_mb": 0.0,
                 "sqlite_mb": round(sqlite_mb, 2),
             },
+            "search": hybrid_metrics,
+            "semantic_projection": semantic_stats,
         }
 
     async def run_maintenance(self, action: str, dry_run: bool = False) -> Dict[str, Any]:

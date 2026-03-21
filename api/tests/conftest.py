@@ -5,7 +5,6 @@ Pytest fixtures for Synapse API tests.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,42 +12,19 @@ from fastapi.testclient import TestClient
 from api.deps import get_event_bus, get_synapse_service
 from api.main import app
 from api.services.event_bus import EventBus
-from synapse.layers import EntityType, LayerManager, SynapseEdge, SynapseNode
+from synapse.layers import LayerManager
 from synapse.layers.episodic import EpisodicManager
 from synapse.layers.procedural import ProceduralManager
+from synapse.layers.semantic import SemanticManager
 from synapse.layers.user_model import UserModelManager
 from synapse.layers.working import WorkingManager
 from synapse.services.synapse_service import SynapseService
 
 
-class DummySemanticManager:
-    """Lightweight semantic manager for API tests."""
-
-    async def search(self, query: str, limit: int = 10, min_score: float = 0.1):
-        return []
-
-    async def add_entity(self, name: str, entity_type: EntityType, summary: str | None = None):
-        return SynapseNode(
-            id=str(uuid4()),
-            type=entity_type,
-            name=name,
-            summary=summary,
-        )
-
-    async def add_fact(self, source_id: str, target_id: str, relation_type):
-        return SynapseEdge(
-            id=str(uuid4()),
-            source_id=source_id,
-            target_id=target_id,
-            type=relation_type,
-        )
-
-    async def get_entity(self, entity_id: str):
-        return None
-
-
 class DummyVectorClient:
     """No-op vector client to keep API tests deterministic and offline."""
+
+    enabled = True
 
     def upsert(self, *args, **kwargs):
         return None
@@ -64,14 +40,19 @@ class DummyVectorClient:
 
 
 @pytest.fixture
-def synapse_service(tmp_path):
+def synapse_service(tmp_path, monkeypatch):
     """Create a real SynapseService backed by temp SQLite databases."""
+    monkeypatch.setenv("SYNAPSE_ENABLE_GRAPHITI", "false")
     vector_client = DummyVectorClient()
     layer_manager = LayerManager(
         user_model_manager=UserModelManager(tmp_path / "user_model.db"),
         procedural_manager=ProceduralManager(tmp_path / "procedural.db", vector_client=vector_client),
         episodic_manager=EpisodicManager(tmp_path / "episodic.db", vector_client=vector_client),
-        semantic_manager=DummySemanticManager(),
+        semantic_manager=SemanticManager(
+            graphiti_client=None,
+            vector_client=vector_client,
+            db_path=tmp_path / "semantic.db",
+        ),
         working_manager=WorkingManager(),
         user_id="test-user",
     )
