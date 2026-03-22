@@ -13,6 +13,23 @@ import type { UserContext, UserPreferences } from "../../lib/types";
 import { IdentityOfflineState, FormSkeleton } from "@/components/ui/empty-states";
 import clsx from "clsx";
 
+function normalizeNotes(notes: unknown): string[] | undefined {
+  if (Array.isArray(notes)) {
+    return notes
+      .map((note) => (typeof note === "string" ? note.trim() : ""))
+      .filter(Boolean);
+  }
+
+  if (typeof notes === "string") {
+    return notes
+      .split(/\r?\n/)
+      .map((note) => note.trim())
+      .filter(Boolean);
+  }
+
+  return undefined;
+}
+
 export default function IdentityPage() {
   const [context, setContext] = useState<UserContext>({});
   const [preferences, setPreferences] = useState<UserPreferences>({});
@@ -33,7 +50,11 @@ export default function IdentityPage() {
       ]);
       setContext(identityData);
       // Handle { user_id, preferences } response format
-      setPreferences(prefsResponse.preferences || prefsResponse);
+      const loadedPreferences = prefsResponse.preferences || prefsResponse;
+      setPreferences({
+        ...loadedPreferences,
+        notes: normalizeNotes(loadedPreferences.notes),
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to load identity";
       setError(message);
@@ -77,7 +98,7 @@ export default function IdentityPage() {
         ...(preferences.response_style ? { response_style: preferences.response_style } : {}),
         ...(preferences.expertise?.length ? { add_expertise: preferences.expertise } : {}),
         ...(preferences.topics?.length ? { add_topics: preferences.topics } : {}),
-        ...(preferences.notes ? { notes: preferences.notes } : {}),
+        ...(preferences.notes !== undefined ? { notes: preferences.notes } : {}),
       };
       await api.updatePreferences(request);
       setSuccess("Preferences saved successfully");
@@ -348,11 +369,14 @@ export default function IdentityPage() {
               </label>
               <textarea
                 placeholder="Additional notes..."
-                value={preferences.notes || ""}
+                value={preferences.notes?.join("\n") || ""}
                 onChange={(e) =>
                   setPreferences((prev) => ({
                     ...prev,
-                    notes: e.target.value || undefined,
+                    notes: e.target.value
+                      .split(/\r?\n/)
+                      .map((note) => note.trim())
+                      .filter(Boolean),
                   }))
                 }
                 rows={3}

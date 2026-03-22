@@ -6,6 +6,7 @@ import { GraphCanvas } from "./graph-canvas";
 import { api } from "../../lib/api-client";
 import type { GraphNode, GraphEdge, GraphData } from "../../lib/types/graph";
 import { GraphOfflineState, GraphSkeleton } from "@/components/ui/empty-states";
+import { formatDate } from "@/lib/utils";
 import clsx from "clsx";
 
 interface SelectedNode {
@@ -249,7 +250,7 @@ export function GraphView() {
               <div className="flex justify-between">
                 <span>Created:</span>
                 <span className="text-text-primary">
-                  {new Date(selectedNode.node.created_at).toLocaleDateString()}
+                  {formatDate(selectedNode.node.created_at)}
                 </span>
               </div>
             </div>

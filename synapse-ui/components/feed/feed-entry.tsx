@@ -19,6 +19,7 @@ import {
   Copy,
 } from "lucide-react";
 import { useState } from "react";
+import { formatDate, formatTimestamp } from "@/lib/utils";
 
 export interface FeedEntry {
   id: string;
@@ -129,6 +130,9 @@ export function FeedEntryRow({ entry }: FeedEntryRowProps) {
   const LayerIcon = layer.icon;
   const ActionIcon = action.icon;
   const [showActions, setShowActions] = useState(false);
+  const timestampDate = formatDate(entry.timestamp);
+  const timestampTime = formatTimestamp(entry.timestamp);
+  const localizedTimestamp = `${timestampDate} ${timestampTime}`;
 
   return (
     <div
@@ -217,7 +221,10 @@ export function FeedEntryRow({ entry }: FeedEntryRowProps) {
             {/* Timestamp */}
             <span className="flex items-center gap-1.5">
               <Clock size={11} />
-              <span className="font-mono">{entry.timestamp}</span>
+              <span className="font-mono" title={localizedTimestamp}>
+                {timestampTime}
+              </span>
+              <span className="hidden md:inline">{timestampDate}</span>
             </span>
 
             {/* Topics - Desktop only */}
