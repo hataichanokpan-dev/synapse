@@ -21,7 +21,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if path in self.EXEMPT_PATHS or any(path.startswith(prefix) for prefix in self.EXEMPT_PREFIXES):
             return await call_next(request)
 
-        api_key = request.headers.get(settings.api_key_header)
+        api_key = request.headers.get(settings.api_key_header) or request.query_params.get("api_key")
         if not api_key or api_key != settings.api_key:
             return JSONResponse(
                 status_code=401,

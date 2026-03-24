@@ -27,6 +27,11 @@ from typing import Any, Dict, Optional
 from urllib import error, request
 from uuid import uuid4
 
+from _utf8_stdio import configure_utf8_stdio
+
+
+configure_utf8_stdio()
+
 
 @dataclass
 class StepResult:

@@ -44,6 +44,8 @@ class Settings(BaseSettings):
         "http://localhost:3001",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:3001",
+        "http://localhost:7533",
+        "http://127.0.0.1:7533",
     ], validation_alias=AliasChoices("CORS_ORIGINS", "cors_origins"))
 
     # Database paths (passed to SynapseService)
@@ -64,6 +66,32 @@ class Settings(BaseSettings):
     anthropic_api_key: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("ANTHROPIC_API_KEY", "anthropic_api_key"),
+    )
+
+    # Graph projection runtime
+    graph_canonical_database: str = Field(
+        default="user-bfipa",
+        validation_alias=AliasChoices("GRAPH_CANONICAL_DATABASE", "graph_canonical_database"),
+    )
+    graph_default_group_id: str = Field(
+        default="global",
+        validation_alias=AliasChoices("GRAPH_DEFAULT_GROUP_ID", "graph_default_group_id"),
+    )
+    graph_projection_max_inflight: int = Field(
+        default=1,
+        validation_alias=AliasChoices("GRAPH_PROJECTION_MAX_INFLIGHT", "graph_projection_max_inflight"),
+    )
+    graph_projection_min_interval_seconds: float = Field(
+        default=10.0,
+        validation_alias=AliasChoices("GRAPH_PROJECTION_MIN_INTERVAL_SECONDS", "graph_projection_min_interval_seconds"),
+    )
+    graph_projection_cooldown_seconds: int = Field(
+        default=300,
+        validation_alias=AliasChoices("GRAPH_PROJECTION_COOLDOWN_SECONDS", "graph_projection_cooldown_seconds"),
+    )
+    graph_projection_max_retries: int = Field(
+        default=12,
+        validation_alias=AliasChoices("GRAPH_PROJECTION_MAX_RETRIES", "graph_projection_max_retries"),
     )
 
     # Feed

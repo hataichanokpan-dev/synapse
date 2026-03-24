@@ -9,7 +9,10 @@ Endpoints:
     PUT    /api/identity/preferences  - Update user preferences
 """
 
+import logging
+
 from fastapi import APIRouter, Depends
+from api.responses import UTF8JSONResponse
 
 from api.deps import get_synapse_service
 from api.models import (
@@ -22,8 +25,10 @@ from api.models import (
     ResponseStyle,
     ResponseLength,
 )
+from api.text_guard import find_corrupted_text_fields
 
 router = APIRouter(tags=["Identity"])
+logger = logging.getLogger(__name__)
 
 
 def _build_preferences_response(result: dict, user_id: str | None = None) -> PreferencesResponse:
@@ -114,6 +119,31 @@ async def update_preferences(
     service=Depends(get_synapse_service),
 ):
     """Update user preferences."""
+    suspicious_fields = find_corrupted_text_fields(
+        {
+            "notes": request.notes,
+            "add_expertise": request.add_expertise,
+            "add_topics": request.add_topics,
+        }
+    )
+    if suspicious_fields:
+        logger.warning(
+            "Rejected suspicious text payload for /api/identity/preferences fields=%s",
+            suspicious_fields,
+        )
+        return UTF8JSONResponse(
+            status_code=422,
+            content={
+                "error": "Suspicious text encoding",
+                "detail": (
+                    "Preference text appears to be corrupted before it reached the API. "
+                    "Retry with a UTF-8 client or terminal."
+                ),
+                "code": "TEXT_ENCODING_SUSPECTED",
+                "fields": suspicious_fields,
+            },
+        )
+
     # Pass fields directly to service - it now handles List[str] for expertise/topics
     result = service.update_user_preferences(
         language=request.language,

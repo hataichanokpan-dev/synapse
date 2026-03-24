@@ -148,18 +148,20 @@ class LayerManager:
         name: str,
         entity_type: EntityType,
         summary: Optional[str] = None,
+        group_id: Optional[str] = None,
     ) -> SynapseNode:
         """Add entity to semantic memory."""
-        return await self.semantic.add_entity(name, entity_type, summary)
+        return await self.semantic.add_entity(name, entity_type, summary, group_id=group_id)
 
     async def add_fact(
         self,
         source_id: str,
         target_id: str,
         relation_type: RelationType,
+        group_id: Optional[str] = None,
     ) -> SynapseEdge:
         """Add fact to semantic memory."""
-        return await self.semantic.add_fact(source_id, target_id, relation_type)
+        return await self.semantic.add_fact(source_id, target_id, relation_type, group_id=group_id)
 
     # ==================== Layer 4: Episodic ====================
 

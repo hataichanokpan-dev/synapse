@@ -59,6 +59,26 @@ docker-compose up -d
 python -m synapse.mcp_server
 ```
 
+### Frontend UI in Docker
+
+The Next.js frontend can run in Docker on `http://localhost:7533`.
+
+```bash
+# Build and start backend + frontend
+docker compose up -d --build falkordb qdrant synapse-api synapse-ui
+```
+
+Default ports:
+- UI: `7533`
+- API: `8000`
+- FalkorDB: `6379`
+- Qdrant: `6333`
+
+Environment notes:
+- `synapse-ui` builds with `NEXT_PUBLIC_API_URL`, defaulting to `http://localhost:8000`
+- if you change the API host/port, also set `NEXT_PUBLIC_API_URL` before `docker compose up --build`
+- the frontend uses the same API key as `SYNAPSE_API_KEY` by default
+
 ### Option 2: Manual Setup
 
 ```bash

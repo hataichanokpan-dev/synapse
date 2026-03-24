@@ -11,11 +11,15 @@ Endpoints:
     POST   /api/memory/consolidate  - Consolidate memories
 """
 
-from fastapi import APIRouter, Depends, Query, HTTPException
+import logging
+
+from fastapi import APIRouter, Depends, Query, HTTPException, Request
 
 from api.deps import get_synapse_service, get_event_bus
 from api.normalization import parse_api_memory_layer, parse_core_memory_layer
+from api.responses import UTF8JSONResponse
 from api.services.event_bus import FeedEventType
+from api.text_guard import find_corrupted_text_fields
 from api.models import (
     MemoryCreate,
     MemoryUpdate,
@@ -32,6 +36,7 @@ from api.models import (
 from synapse.search import HybridSearchError
 
 router = APIRouter(tags=["Memory"])
+logger = logging.getLogger(__name__)
 
 
 def _memory_response_from_result(result: dict, fallback_uuid: str = "") -> MemoryResponse:
@@ -100,10 +105,38 @@ async def get_memory(
 @router.post("/", response_model=MemoryResponse)
 async def add_memory(
     request: MemoryCreate,
+    http_request: Request,
     service=Depends(get_synapse_service),
     event_bus=Depends(get_event_bus),
 ):
     """Add a new memory."""
+    suspicious_fields = find_corrupted_text_fields(
+        {
+            "name": request.name,
+            "content": request.content,
+            "source_description": request.source_description,
+        }
+    )
+    if suspicious_fields:
+        logger.warning(
+            "Rejected suspicious text payload for /api/memory/ from %s source=%s fields=%s",
+            getattr(http_request.client, "host", "unknown"),
+            request.source,
+            suspicious_fields,
+        )
+        return UTF8JSONResponse(
+            status_code=422,
+            content={
+                "error": "Suspicious text encoding",
+                "detail": (
+                    "Request text appears to be corrupted before it reached the API. "
+                    "This usually means the client sent Thai text through a non-UTF-8 code page."
+                ),
+                "code": "TEXT_ENCODING_SUSPECTED",
+                "fields": suspicious_fields,
+            },
+        )
+
     result = await service.add_memory(
         name=request.name,
         episode_body=request.content,

@@ -33,14 +33,15 @@ async def verify_api_key(
     api_key: Optional[str] = Depends(api_key_header)
 ) -> str:
     """Verify API key from header."""
+    resolved_api_key = api_key or request.query_params.get("api_key")
     if settings.api_key and settings.api_key != "synapse-dev-key":
-        if not api_key or api_key != settings.api_key:
+        if not resolved_api_key or resolved_api_key != settings.api_key:
             raise HTTPException(
                 status_code=401,
                 detail="Invalid or missing API key",
                 headers={settings.api_key_header: "Required"},
             )
-    return api_key or "anonymous"
+    return resolved_api_key or "anonymous"
 
 
 # Service singletons
@@ -184,6 +185,11 @@ async def init_services():
         layer_manager=layer_manager,
         user_id=os.getenv("USER_ID", "cerberus"),
     )
+    if hasattr(_synapse_service, "set_event_bus"):
+        _synapse_service.set_event_bus(_event_bus)
+    semantic_manager = getattr(_synapse_service.layers, "semantic", None)
+    if semantic_manager is not None and hasattr(semantic_manager, "start_background_processing"):
+        semantic_manager.start_background_processing()
     print(f"[OK] SynapseService initialized (user: {_synapse_service.user_id}, graphiti: {'yes' if _graphiti_client else 'no'})")
 
 
@@ -192,6 +198,11 @@ async def shutdown_services():
     global _synapse_service, _event_bus, _graphiti_client
 
     # Close Graphiti client if it exists
+    if _synapse_service is not None:
+        semantic_manager = getattr(_synapse_service.layers, "semantic", None)
+        if semantic_manager is not None and hasattr(semantic_manager, "stop_background_processing"):
+            semantic_manager.stop_background_processing()
+
     if _graphiti_client is not None:
         try:
             await _graphiti_client.close()

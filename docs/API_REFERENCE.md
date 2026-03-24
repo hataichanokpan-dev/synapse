@@ -30,6 +30,7 @@ Browser (Next.js) → FastAPI (:8000) → SynapseService → FalkorDB / Qdrant /
 
 **CORS**: All origins allowed in dev mode.  
 **Auth**: Optional API key via `X-API-Key` header.
+**Runtime storage note**: local defaults use `~/.synapse`, but Docker deployments use `/app/.synapse` as the canonical SQLite runtime store. Host-side `~/.synapse` is not the source of truth unless it is mounted to that path inside the container.
 
 ---
 
@@ -41,14 +42,14 @@ Browser (Next.js) → FastAPI (:8000) → SynapseService → FalkorDB / Qdrant /
 **Response:**
 ```json
 {
-  "status": "healthy",
-  "message": "All systems operational",
+  "status": "degraded",
+  "message": "Some components degraded",
   "components": [
     {
       "name": "falkordb",
-      "status": "healthy",
+      "status": "degraded",
       "latency_ms": null,
-      "message": "ok",
+      "message": "not initialized",
       "details": {}
     },
     {
@@ -71,10 +72,45 @@ Browser (Next.js) → FastAPI (:8000) → SynapseService → FalkorDB / Qdrant /
       "latency_ms": null,
       "message": "ok",
       "details": {}
+    },
+    {
+      "name": "semantic_outbox_graph",
+      "status": "degraded",
+      "latency_ms": null,
+      "message": "degraded: pending=3, failed=3, dead_letter=0, circuit=paused_by_rate_limit",
+      "details": {
+        "pending_count": 3,
+        "failed_count": 3,
+        "due_count": 1,
+        "dead_letter_count": 0,
+        "leased_count": 0,
+        "circuit_state": "paused_by_rate_limit",
+        "cooldown_until": "2026-03-24T01:25:00Z",
+        "last_error_code": "RATE_LIMIT",
+        "provider_last_429_at": "2026-03-24T01:20:00Z",
+        "last_projected_at": "2026-03-24T01:10:00Z",
+        "next_attempt_at": "2026-03-24T01:20:00Z"
+      }
+    },
+    {
+      "name": "semantic_outbox_vector",
+      "status": "healthy",
+      "latency_ms": null,
+      "message": "ok",
+      "details": {}
+    },
+    {
+      "name": "hybrid_search",
+      "status": "degraded",
+      "latency_ms": null,
+      "message": "degraded: graph",
+      "details": {}
     }
   ]
 }
 ```
+
+`semantic_outbox_graph` และ `semantic_outbox_vector` ใช้บอกสถานะ background projection แยกตาม backend โดยตรง ไม่ต้องเดาจาก status รวมของ `hybrid_search`
 
 **Frontend Usage:**
 ```typescript
@@ -105,6 +141,43 @@ const isHealthy = data.status === "healthy";
     "qdrant_mb": 0.0,
     "sqlite_mb": 0.18
   },
+  "search": {
+    "counts": {},
+    "latency_ms": {},
+    "semantic_projection": {
+      "nodes": 12,
+      "edges": 8,
+      "outbox": {
+        "graph": {
+          "pending_count": 3,
+          "failed_count": 3,
+          "due_count": 1,
+          "dead_letter_count": 0,
+          "leased_count": 0,
+          "lag_seconds": 742.6,
+          "unhealthy": true,
+          "oldest_active_at": "2026-03-24T01:15:00Z",
+          "oldest_due_at": "2026-03-24T01:15:00Z",
+          "next_attempt_at": "2026-03-24T01:20:00Z",
+          "last_error_excerpt": "429 rate limit exceeded",
+          "circuit_state": "paused_by_rate_limit",
+          "cooldown_until": "2026-03-24T01:25:00Z",
+          "last_error_code": "RATE_LIMIT",
+          "provider_last_429_at": "2026-03-24T01:20:00Z",
+          "last_projected_at": "2026-03-24T01:10:00Z"
+        },
+        "vector": {
+          "pending_count": 0,
+          "failed_count": 0,
+          "lag_seconds": 0.0,
+          "unhealthy": false,
+          "oldest_active_at": null,
+          "next_attempt_at": null,
+          "last_error_excerpt": null
+        }
+      }
+    }
+  },
   "last_updated": "2026-03-18T15:05:54.305168"
 }
 ```
@@ -117,14 +190,14 @@ const isHealthy = data.status === "healthy";
 **Request:**
 ```json
 {
-  "action": "decay_refresh",
+  "actions": ["replay_semantic_outbox", "rebuild_semantic_graph"],
   "dry_run": true
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `action` | string | Yes | `decay_refresh`, `purge_expired`, `reindex`, `optimize` |
+| `actions` | array[string] | Yes | รายการ action ที่ต้องการรัน: `decay_refresh`, `purge_expired`, `rebuild_fts`, `vacuum_sqlite`, `replay_semantic_outbox`, `rebuild_semantic_graph`, `pause_graph_projection`, `resume_graph_projection`, `replay_dead_letter_graph` |
 | `dry_run` | boolean | No | `true` = preview only (default: `false`) |
 
 **Response:**
@@ -132,11 +205,18 @@ const isHealthy = data.status === "healthy";
 {
   "results": [
     {
-      "action": "decay_refresh",
-      "affected": 0,
+      "action": "replay_semantic_outbox",
+      "affected": 3,
       "duration_ms": 0.0,
       "success": true,
-      "message": "Completed"
+      "message": "Would replay 3 due semantic outbox tasks (graph=3)"
+    },
+    {
+      "action": "rebuild_semantic_graph",
+      "affected": 12,
+      "duration_ms": 0.0,
+      "success": true,
+      "message": "Would rebuild 12 semantic graph projection records (nodes=9, edges=3)"
     }
   ],
   "total_duration_ms": 0.0,
@@ -144,6 +224,10 @@ const isHealthy = data.status === "healthy";
   "completed_at": "2026-03-18T15:05:56.335123"
 }
 ```
+
+`replay_semantic_outbox` ใช้ trigger งานที่ถึงเวลาใน `semantic_outbox` ให้ลองใหม่ทันที ส่วน `rebuild_semantic_graph` ใช้สร้างงาน graph projection ใหม่จาก SQLite truth store แบบ idempotent
+
+`pause_graph_projection` และ `resume_graph_projection` ใช้ควบคุม graph projector ตอน incident/recovery ส่วน `replay_dead_letter_graph` ใช้ requeue งาน graph ที่ถูกย้ายไป `dead_letter`
 
 ---
 
@@ -768,7 +852,7 @@ SSE (Server-Sent Events) stream สำหรับ real-time updates
 
 **Frontend Usage:**
 ```typescript
-const eventSource = new EventSource("/api/feed/stream");
+const eventSource = new EventSource("/api/feed/stream?api_key=YOUR_API_KEY");
 
 eventSource.onmessage = (event) => {
   const data = JSON.parse(event.data);
@@ -779,6 +863,13 @@ eventSource.onerror = () => {
   eventSource.close();
 };
 ```
+
+Graph projector จะ emit event types ต่อไปนี้ใน stream นี้:
+- `graph.projection.queued`
+- `graph.projection.completed`
+- `graph.projection.failed`
+- `graph.circuit.open`
+- `graph.circuit.closed`
 
 ---
 

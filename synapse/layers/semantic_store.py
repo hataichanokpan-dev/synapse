@@ -7,11 +7,14 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .types import EntityType, MemoryLayer, RelationType, SynapseEdge, SynapseNode, utcnow
 
 DEFAULT_DB_PATH = Path.home() / ".synapse" / "semantic.db"
+_DEFAULT_PROJECTOR_BACKENDS = ("graph", "vector")
+_RETRYABLE_OUTBOX_STATUSES = ("pending", "retry_wait", "failed")
+_ACTIVE_OUTBOX_STATUSES = ("pending", "retry_wait", "failed", "leased")
 
 _nlp_preprocessor = None
 
@@ -114,11 +117,50 @@ class SemanticProjectionStore:
                 )
                 """
             )
+            self._ensure_column(conn, "semantic_outbox", "lease_owner TEXT")
+            self._ensure_column(conn, "semantic_outbox", "leased_at TEXT")
+            self._ensure_column(conn, "semantic_outbox", "available_at TEXT")
+            self._ensure_column(conn, "semantic_outbox", "error_code TEXT")
+            self._ensure_column(conn, "semantic_outbox", "error_class TEXT")
+            self._ensure_column(conn, "semantic_outbox", "projector_version TEXT DEFAULT 'v1'")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS semantic_projector_state (
+                    backend TEXT PRIMARY KEY,
+                    circuit_state TEXT NOT NULL DEFAULT 'closed',
+                    cooldown_until TEXT,
+                    pause_reason TEXT,
+                    last_error_code TEXT,
+                    provider_last_429_at TEXT,
+                    last_projected_at TEXT,
+                    last_error TEXT,
+                    failure_streak INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_nodes_type ON semantic_nodes(entity_type)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_semantic_outbox_backend ON semantic_outbox(target_backend, status, next_attempt_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_semantic_outbox_available ON semantic_outbox(target_backend, status, available_at)"
+            )
+            conn.execute(
+                """
+                UPDATE semantic_outbox
+                SET status = 'retry_wait'
+                WHERE status = 'failed'
+                """
+            )
+            conn.execute(
+                """
+                UPDATE semantic_outbox
+                SET available_at = COALESCE(available_at, next_attempt_at, created_at),
+                    projector_version = COALESCE(NULLIF(projector_version, ''), 'v1')
+                """
             )
             # Rebuild the derived lexical index from the SQLite source of truth.
             conn.execute("DELETE FROM semantic_nodes_fts")
@@ -129,6 +171,15 @@ class SemanticProjectionStore:
                 FROM semantic_nodes
                 """
             )
+
+    def _ensure_column(self, conn: sqlite3.Connection, table_name: str, column_def: str) -> None:
+        column_name = column_def.split()[0]
+        existing = {
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
 
     @contextmanager
     def _get_connection(self):
@@ -194,7 +245,7 @@ class SemanticProjectionStore:
                     node.created_by,
                     node.user_id,
                     node.agent_id,
-                    None,
+                    node.chat_id,
                     json.dumps(metadata, ensure_ascii=False),
                     node.created_at.isoformat(),
                     node.updated_at.isoformat(),
@@ -344,19 +395,37 @@ class SemanticProjectionStore:
         op_type: str,
         payload: Dict[str, Any],
         dedupe_key: str,
+        status: str = "pending",
+        available_at: Optional[str] = None,
+        error_code: Optional[str] = None,
+        error_class: Optional[str] = None,
+        projector_version: str = "v2",
     ) -> None:
         now = utcnow().isoformat()
+        scheduled_at = available_at or now
         with self._get_connection() as conn:
             conn.execute(
                 """
                 INSERT INTO semantic_outbox (
                     operation_id, target_backend, record_id, op_type, payload_json,
-                    status, retry_count, next_attempt_at, last_error, dedupe_key, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, NULL, ?, ?, ?)
+                    status, retry_count, next_attempt_at, available_at, last_error, error_code, error_class,
+                    lease_owner, leased_at, dedupe_key, projector_version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?)
                 ON CONFLICT(dedupe_key) DO UPDATE SET
                     payload_json = excluded.payload_json,
-                    status = 'pending',
+                    status = excluded.status,
                     next_attempt_at = excluded.next_attempt_at,
+                    available_at = excluded.available_at,
+                    last_error = NULL,
+                    error_code = NULL,
+                    error_class = NULL,
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    retry_count = CASE
+                        WHEN excluded.status = 'pending' THEN 0
+                        ELSE semantic_outbox.retry_count
+                    END,
+                    projector_version = excluded.projector_version,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -365,8 +434,13 @@ class SemanticProjectionStore:
                     record_id,
                     op_type,
                     json.dumps(payload, ensure_ascii=False, default=str),
-                    now,
+                    status,
+                    scheduled_at,
+                    scheduled_at,
+                    error_code,
+                    error_class,
                     dedupe_key,
+                    projector_version,
                     now,
                     now,
                 ),
@@ -379,8 +453,8 @@ class SemanticProjectionStore:
                 """
                 SELECT * FROM semantic_outbox
                 WHERE target_backend = ?
-                  AND status IN ('pending', 'failed')
-                  AND next_attempt_at <= ?
+                  AND status IN ('pending', 'retry_wait', 'failed')
+                  AND COALESCE(available_at, next_attempt_at, created_at) <= ?
                 ORDER BY created_at ASC
                 LIMIT ?
                 """,
@@ -388,67 +462,461 @@ class SemanticProjectionStore:
             )
             return cursor.fetchall()
 
+    def release_expired_leases(
+        self,
+        *,
+        lease_timeout_seconds: int,
+        target_backend: Optional[str] = None,
+    ) -> int:
+        cutoff = datetime.fromtimestamp(
+            utcnow().timestamp() - max(1, int(lease_timeout_seconds)),
+            tz=timezone.utc,
+        ).isoformat()
+        clauses = ["status = 'leased'", "leased_at IS NOT NULL", "leased_at <= ?"]
+        params: List[Any] = [cutoff]
+        if target_backend is not None:
+            clauses.append("target_backend = ?")
+            params.append(target_backend)
+        sql = f"""
+            UPDATE semantic_outbox
+            SET status = 'pending',
+                lease_owner = NULL,
+                leased_at = NULL,
+                available_at = COALESCE(available_at, next_attempt_at, created_at),
+                updated_at = ?
+            WHERE {' AND '.join(clauses)}
+        """
+        params = [utcnow().isoformat(), *params]
+        with self._get_connection() as conn:
+            cursor = conn.execute(sql, params)
+            return int(cursor.rowcount or 0)
+
+    def lease_due_outbox(
+        self,
+        *,
+        target_backend: str,
+        lease_owner: str,
+        limit: int = 20,
+        lease_timeout_seconds: int = 300,
+    ) -> List[sqlite3.Row]:
+        self.release_expired_leases(
+            lease_timeout_seconds=lease_timeout_seconds,
+            target_backend=target_backend,
+        )
+        now = utcnow().isoformat()
+        with self._get_connection() as conn:
+            due_rows = conn.execute(
+                """
+                SELECT operation_id
+                FROM semantic_outbox
+                WHERE target_backend = ?
+                  AND status IN ('pending', 'retry_wait', 'failed')
+                  AND COALESCE(available_at, next_attempt_at, created_at) <= ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (target_backend, now, limit),
+            ).fetchall()
+            operation_ids = [str(row["operation_id"]) for row in due_rows if row["operation_id"]]
+            if not operation_ids:
+                return []
+
+            placeholders = ", ".join("?" for _ in operation_ids)
+            conn.execute(
+                f"""
+                UPDATE semantic_outbox
+                SET status = 'leased',
+                    lease_owner = ?,
+                    leased_at = ?,
+                    updated_at = ?
+                WHERE operation_id IN ({placeholders})
+                """,
+                [lease_owner, now, now, *operation_ids],
+            )
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM semantic_outbox
+                WHERE operation_id IN ({placeholders})
+                ORDER BY created_at ASC
+                """,
+                operation_ids,
+            ).fetchall()
+        return rows
+
+    def count_outbox_rows(
+        self,
+        *,
+        target_backend: Optional[str] = None,
+        statuses: Optional[Sequence[str]] = None,
+        due_only: bool = False,
+    ) -> int:
+        clauses = ["1 = 1"]
+        params: List[Any] = []
+        normalized_statuses = [str(status) for status in (statuses or []) if status]
+
+        if target_backend is not None:
+            clauses.append("target_backend = ?")
+            params.append(target_backend)
+
+        if normalized_statuses:
+            placeholders = ", ".join("?" for _ in normalized_statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(normalized_statuses)
+
+        if due_only:
+            clauses.append("COALESCE(available_at, next_attempt_at, created_at) <= ?")
+            params.append(utcnow().isoformat())
+
+        sql = f"SELECT COUNT(*) AS count FROM semantic_outbox WHERE {' AND '.join(clauses)}"
+        with self._get_connection() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return int(row["count"] if row is not None else 0)
+
+    def list_outbox_backends(self) -> List[str]:
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT target_backend FROM semantic_outbox ORDER BY target_backend"
+            ).fetchall()
+        return [str(row["target_backend"]) for row in rows if row["target_backend"]]
+
     def mark_outbox_success(self, operation_id: str) -> None:
         with self._get_connection() as conn:
             conn.execute(
                 """
                 UPDATE semantic_outbox
-                SET status = 'done', updated_at = ?, last_error = NULL
+                SET status = 'done',
+                    updated_at = ?,
+                    last_error = NULL,
+                    error_code = NULL,
+                    error_class = NULL,
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    available_at = ?
                 WHERE operation_id = ?
                 """,
-                (utcnow().isoformat(), operation_id),
+                (utcnow().isoformat(), utcnow().isoformat(), operation_id),
             )
 
-    def mark_outbox_failure(self, operation_id: str, error: str, retry_count: int) -> None:
-        delay_seconds = min(300, max(15, 15 * (2 ** min(retry_count, 4))))
+    def mark_outbox_retry(
+        self,
+        operation_id: str,
+        error: str,
+        retry_count: int,
+        *,
+        delay_seconds: Optional[int] = None,
+        error_code: Optional[str] = None,
+        error_class: Optional[str] = None,
+    ) -> None:
+        delay_seconds = delay_seconds if delay_seconds is not None else min(300, max(15, 15 * (2 ** min(retry_count, 4))))
         next_attempt = utcnow().timestamp() + delay_seconds
         with self._get_connection() as conn:
             conn.execute(
                 """
                 UPDATE semantic_outbox
-                SET status = 'failed',
+                SET status = 'retry_wait',
                     retry_count = ?,
                     next_attempt_at = ?,
+                    available_at = ?,
                     last_error = ?,
+                    error_code = ?,
+                    error_class = ?,
+                    lease_owner = NULL,
+                    leased_at = NULL,
                     updated_at = ?
                 WHERE operation_id = ?
                 """,
                 (
                     retry_count,
                     datetime.fromtimestamp(next_attempt, tz=timezone.utc).isoformat(),
+                    datetime.fromtimestamp(next_attempt, tz=timezone.utc).isoformat(),
                     error[:500],
+                    error_code,
+                    error_class,
                     utcnow().isoformat(),
                     operation_id,
                 ),
             )
 
+    def mark_outbox_failure(
+        self,
+        operation_id: str,
+        error: str,
+        retry_count: int,
+        *,
+        delay_seconds: Optional[int] = None,
+        error_code: Optional[str] = None,
+        error_class: Optional[str] = None,
+    ) -> None:
+        """Backward-compatible alias for retryable failures."""
+        self.mark_outbox_retry(
+            operation_id,
+            error,
+            retry_count,
+            delay_seconds=delay_seconds,
+            error_code=error_code,
+            error_class=error_class,
+        )
+
+    def mark_outbox_dead_letter(
+        self,
+        operation_id: str,
+        error: str,
+        retry_count: int,
+        *,
+        error_code: Optional[str] = None,
+        error_class: Optional[str] = None,
+    ) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE semantic_outbox
+                SET status = 'dead_letter',
+                    retry_count = ?,
+                    last_error = ?,
+                    error_code = ?,
+                    error_class = ?,
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    available_at = NULL,
+                    updated_at = ?
+                WHERE operation_id = ?
+                """,
+                (
+                    retry_count,
+                    error[:500],
+                    error_code,
+                    error_class,
+                    utcnow().isoformat(),
+                    operation_id,
+                ),
+            )
+
+    def requeue_outbox_rows(
+        self,
+        *,
+        target_backend: str,
+        source_status: str,
+        reset_retry_count: bool = False,
+    ) -> int:
+        now = utcnow().isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE semantic_outbox
+                SET status = 'pending',
+                    retry_count = CASE WHEN ? THEN 0 ELSE retry_count END,
+                    available_at = ?,
+                    next_attempt_at = ?,
+                    last_error = NULL,
+                    error_code = NULL,
+                    error_class = NULL,
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    updated_at = ?
+                WHERE target_backend = ?
+                  AND status = ?
+                """,
+                (
+                    1 if reset_retry_count else 0,
+                    now,
+                    now,
+                    now,
+                    target_backend,
+                    source_status,
+                ),
+            )
+            return int(cursor.rowcount or 0)
+
+    def get_projector_state(self, backend: str) -> Dict[str, Any]:
+        with self._get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM semantic_projector_state
+                WHERE backend = ?
+                """,
+                (backend,),
+            ).fetchone()
+        if row is None:
+            return {
+                "backend": backend,
+                "circuit_state": "closed",
+                "cooldown_until": None,
+                "pause_reason": None,
+                "last_error_code": None,
+                "provider_last_429_at": None,
+                "last_projected_at": None,
+                "last_error": None,
+                "failure_streak": 0,
+                "updated_at": None,
+            }
+        return dict(row)
+
+    def update_projector_state(self, backend: str, **fields: Any) -> Dict[str, Any]:
+        state = self.get_projector_state(backend)
+        state.update({key: value for key, value in fields.items()})
+        state["backend"] = backend
+        state["updated_at"] = utcnow().isoformat()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO semantic_projector_state (
+                    backend, circuit_state, cooldown_until, pause_reason, last_error_code,
+                    provider_last_429_at, last_projected_at, last_error, failure_streak, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(backend) DO UPDATE SET
+                    circuit_state = excluded.circuit_state,
+                    cooldown_until = excluded.cooldown_until,
+                    pause_reason = excluded.pause_reason,
+                    last_error_code = excluded.last_error_code,
+                    provider_last_429_at = excluded.provider_last_429_at,
+                    last_projected_at = excluded.last_projected_at,
+                    last_error = excluded.last_error,
+                    failure_streak = excluded.failure_streak,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    backend,
+                    state.get("circuit_state", "closed"),
+                    state.get("cooldown_until"),
+                    state.get("pause_reason"),
+                    state.get("last_error_code"),
+                    state.get("provider_last_429_at"),
+                    state.get("last_projected_at"),
+                    state.get("last_error"),
+                    int(state.get("failure_streak") or 0),
+                    state["updated_at"],
+                ),
+            )
+        return state
+
     def get_outbox_health(self) -> Dict[str, Dict[str, Any]]:
         now = utcnow()
         health: Dict[str, Dict[str, Any]] = {}
         with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                SELECT target_backend,
-                       MAX(retry_count) AS max_retry_count,
-                       MIN(created_at) AS oldest_created_at,
-                       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
-                       SUM(CASE WHEN status IN ('pending', 'failed') THEN 1 ELSE 0 END) AS pending_count
-                FROM semantic_outbox
-                GROUP BY target_backend
-                """
+            backends = sorted(
+                set(_DEFAULT_PROJECTOR_BACKENDS).union(
+                    {
+                        str(row["target_backend"])
+                        for row in conn.execute(
+                            "SELECT DISTINCT target_backend FROM semantic_outbox ORDER BY target_backend"
+                        ).fetchall()
+                        if row["target_backend"]
+                    }
+                ).union(
+                    {
+                        str(row["backend"])
+                        for row in conn.execute(
+                            "SELECT DISTINCT backend FROM semantic_projector_state ORDER BY backend"
+                        ).fetchall()
+                        if row["backend"]
+                    }
+                )
             )
-            rows = cursor.fetchall()
-        for row in rows:
-            oldest = _parse_datetime(row["oldest_created_at"])
-            lag_seconds = max(0.0, (now - oldest).total_seconds()) if oldest else 0.0
-            health[str(row["target_backend"])] = {
-                "max_retry_count": int(row["max_retry_count"] or 0),
-                "failed_count": int(row["failed_count"] or 0),
-                "pending_count": int(row["pending_count"] or 0),
-                "lag_seconds": lag_seconds,
-                "unhealthy": int(row["max_retry_count"] or 0) > 3 or lag_seconds > 60.0,
-            }
+            for backend in backends:
+                active_row = conn.execute(
+                    """
+                    SELECT MAX(retry_count) AS max_retry_count,
+                           MIN(created_at) AS oldest_active_at,
+                           MIN(COALESCE(available_at, next_attempt_at, created_at)) AS next_attempt_at,
+                           MIN(CASE
+                               WHEN status IN ('pending', 'retry_wait', 'failed')
+                                    AND COALESCE(available_at, next_attempt_at, created_at) <= ?
+                               THEN COALESCE(available_at, next_attempt_at, created_at)
+                           END) AS oldest_due_at,
+                           SUM(CASE WHEN status IN ('retry_wait', 'failed') THEN 1 ELSE 0 END) AS failed_count,
+                           SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) AS dead_letter_count,
+                           SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END) AS leased_count,
+                           SUM(CASE
+                               WHEN status IN ('pending', 'retry_wait', 'failed')
+                                    AND COALESCE(available_at, next_attempt_at, created_at) <= ?
+                               THEN 1 ELSE 0
+                           END) AS due_count,
+                           SUM(CASE WHEN status IN ('pending', 'retry_wait', 'failed') THEN 1 ELSE 0 END) AS pending_count
+                    FROM semantic_outbox
+                    WHERE target_backend = ?
+                      AND status IN ('pending', 'retry_wait', 'failed', 'leased', 'dead_letter')
+                    """,
+                    (now.isoformat(), now.isoformat(), backend),
+                ).fetchone()
+                error_row = conn.execute(
+                    """
+                    SELECT last_error, error_code
+                    FROM semantic_outbox
+                    WHERE target_backend = ?
+                      AND status IN ('retry_wait', 'failed', 'dead_letter')
+                      AND last_error IS NOT NULL
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (backend,),
+                ).fetchone()
+                projector_state = self.get_projector_state(backend)
+                oldest_active = _parse_datetime(active_row["oldest_active_at"]) if active_row else None
+                next_attempt = _parse_datetime(active_row["next_attempt_at"]) if active_row else None
+                oldest_due = _parse_datetime(active_row["oldest_due_at"]) if active_row else None
+                pending_count = int(active_row["pending_count"] or 0) if active_row else 0
+                failed_count = int(active_row["failed_count"] or 0) if active_row else 0
+                due_count = int(active_row["due_count"] or 0) if active_row else 0
+                dead_letter_count = int(active_row["dead_letter_count"] or 0) if active_row else 0
+                leased_count = int(active_row["leased_count"] or 0) if active_row else 0
+                max_retry_count = int(active_row["max_retry_count"] or 0) if active_row else 0
+                lag_anchor = oldest_due or oldest_active
+                lag_seconds = max(0.0, (now - lag_anchor).total_seconds()) if lag_anchor else 0.0
+                last_error = str(error_row["last_error"]) if error_row and error_row["last_error"] else None
+                last_error_code = (
+                    str(projector_state.get("last_error_code"))
+                    if projector_state.get("last_error_code")
+                    else str(error_row["error_code"])
+                    if error_row and error_row["error_code"]
+                    else None
+                )
+                circuit_state = str(projector_state.get("circuit_state") or "closed")
+                unhealthy = (
+                    dead_letter_count > 0
+                    or circuit_state not in {"closed", "half_open"}
+                    or (pending_count > 0 and (max_retry_count > 3 or lag_seconds > 60.0))
+                )
+                health[backend] = {
+                    "max_retry_count": max_retry_count,
+                    "failed_count": failed_count,
+                    "pending_count": pending_count,
+                    "due_count": due_count,
+                    "dead_letter_count": dead_letter_count,
+                    "leased_count": leased_count,
+                    "lag_seconds": lag_seconds,
+                    "unhealthy": unhealthy,
+                    "oldest_active_at": oldest_active.isoformat() if oldest_active else None,
+                    "oldest_due_at": oldest_due.isoformat() if oldest_due else None,
+                    "next_attempt_at": next_attempt.isoformat() if next_attempt else None,
+                    "last_error_excerpt": last_error[:200] if last_error else None,
+                    "circuit_state": circuit_state,
+                    "cooldown_until": projector_state.get("cooldown_until"),
+                    "pause_reason": projector_state.get("pause_reason"),
+                    "last_error_code": last_error_code,
+                    "provider_last_429_at": projector_state.get("provider_last_429_at"),
+                    "last_projected_at": projector_state.get("last_projected_at"),
+                }
         return health
+
+    def fetch_graph_rebuild_nodes(self, limit: Optional[int] = None) -> List[sqlite3.Row]:
+        sql = "SELECT * FROM semantic_nodes ORDER BY updated_at ASC"
+        params: List[Any] = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self._get_connection() as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def fetch_graph_rebuild_edges(self, limit: Optional[int] = None) -> List[sqlite3.Row]:
+        sql = "SELECT * FROM semantic_edges ORDER BY created_at ASC"
+        params: List[Any] = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self._get_connection() as conn:
+            return conn.execute(sql, params).fetchall()
 
     def get_stats(self) -> Dict[str, Any]:
         with self._get_connection() as conn:

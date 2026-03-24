@@ -26,6 +26,11 @@ class FeedEventType(str, Enum):
     CONSOLIDATION = "consolidation"
     MAINTENANCE = "maintenance"
     SYSTEM_ERROR = "system.error"
+    GRAPH_PROJECTION_QUEUED = "graph.projection.queued"
+    GRAPH_PROJECTION_COMPLETED = "graph.projection.completed"
+    GRAPH_PROJECTION_FAILED = "graph.projection.failed"
+    GRAPH_CIRCUIT_OPEN = "graph.circuit.open"
+    GRAPH_CIRCUIT_CLOSED = "graph.circuit.closed"
 
 
 class FeedEvent(BaseModel):

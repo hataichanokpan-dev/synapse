@@ -9,10 +9,18 @@ import json
 import logging
 import os
 import re
+from time import perf_counter
 from datetime import datetime as dt
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from api.services.event_bus import FeedEventType
+from synapse.graph_runtime import (
+    bind_graph_driver,
+    bind_graphiti_client,
+    load_graph_projection_runtime_config,
+    normalize_graph_group_id,
+)
 from synapse.layers import (
     LayerManager,
     MemoryLayer,
@@ -224,11 +232,7 @@ def _normalize_core_layers(values: Optional[List[Any]]) -> Optional[List[MemoryL
 
 def _sanitize_graph_group_id(group_id: Optional[str]) -> str:
     """Sanitize group IDs for Graphiti/FalkorDB fulltext compatibility."""
-    if group_id is None:
-        return "default"
-    sanitized = re.sub(r"[^A-Za-z0-9_]+", "_", str(group_id).strip())
-    sanitized = sanitized.strip("_")
-    return sanitized or "default"
+    return normalize_graph_group_id(group_id)
 
 
 def _sanitize_graph_group_ids(group_ids: Optional[List[str]]) -> Optional[List[str]]:
@@ -274,6 +278,7 @@ class SynapseService:
             chat_id: Optional chat/conversation identifier
         """
         self.graphiti = graphiti_client
+        self._graph_runtime = load_graph_projection_runtime_config()
         self.layers = layer_manager or LayerManager()
         semantic_manager = getattr(self.layers, "semantic", None)
         if semantic_manager is not None and getattr(semantic_manager, "_graphiti", None) is None:
@@ -282,6 +287,14 @@ class SynapseService:
         self.agent_id = agent_id
         self.chat_id = chat_id
         self.hybrid_search = HybridSearchEngine(self.layers, self.graphiti)
+        self._event_bus = None
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Attach the API event bus to the service and semantic projector."""
+        self._event_bus = event_bus
+        semantic_manager = getattr(self.layers, "semantic", None)
+        if semantic_manager is not None and hasattr(semantic_manager, "set_event_bus"):
+            semantic_manager.set_event_bus(event_bus)
 
     def _serialize_episode_memory(
         self,
@@ -603,41 +616,15 @@ class SynapseService:
         )
         self._bump_search_generations(detected_layer)
 
-        # Step 3: Store in Graphiti for knowledge graph (optional)
+        # Step 3: Graph projection is always asynchronous via the projector queue.
         graphiti_result = None
-        if persist_graphiti and self.graphiti is not None:
-            try:
-                # Import EpisodeType for source conversion
-                from graphiti_core.nodes import EpisodeType
-                from datetime import datetime as dt
-
-                episode_type = EpisodeType.text  # Default
-                if source:
-                    try:
-                        episode_type = EpisodeType[source.lower()]
-                    except (KeyError, AttributeError):
-                        logger.warning(f"Unknown source type '{source}', using 'text' as default")
-                        episode_type = EpisodeType.text
-
-                # Graphiti requires a valid reference_time, default to now if not provided
-                resolved_reference_time = _coerce_datetime(reference_time) or datetime.now(timezone.utc)
-
-                # Graphiti requires a valid group_id (alphanumeric, dashes, underscores only)
-                # Default to 'default' if not provided
-                resolved_group_id = _sanitize_graph_group_id(group_id)
-
-                graphiti_result = await self.graphiti.add_episode(
-                    name=name,
-                    episode_body=episode_body,
-                    source_description=source_description,
-                    reference_time=resolved_reference_time,
-                    group_id=resolved_group_id,
-                    source=episode_type,
-                    uuid=uuid,
-                    **kwargs,
-                )
-            except Exception as e:
-                logger.error(f"Failed to store in Graphiti: {e}")
+        if persist_graphiti:
+            graphiti_result = {
+                "queued": bool(self.graphiti is not None or os.getenv("SYNAPSE_REQUIRE_GRAPHITI", "false").lower() == "true"),
+                "mode": "projector",
+                "group_id": _sanitize_graph_group_id(group_id),
+                "reference_time": (_coerce_datetime(reference_time) or datetime.now(timezone.utc)).isoformat(),
+            }
 
         return {
             **layer_result,
@@ -686,6 +673,7 @@ class SynapseService:
                 name=name,
                 entity_type=EntityType.CONCEPT,
                 summary=content,
+                group_id=group_id,
             )
 
         elif layer == MemoryLayer.EPISODIC:
@@ -771,7 +759,9 @@ class SynapseService:
         graphiti_results = []
         if self.graphiti is not None:
             try:
-                graphiti_results = await self.graphiti.search(query=query, num_results=limit)
+                graphiti_client = self._get_bound_graphiti_client()
+                if graphiti_client is not None:
+                    graphiti_results = await graphiti_client.search(query=query, num_results=limit)
             except Exception as e:
                 logger.error(f"Graphiti search failed: {e}")
 
@@ -1933,9 +1923,8 @@ class SynapseService:
 
         # Also pull recent graphiti episodes from FalkorDB
         try:
-            if self.graphiti:
-                driver = getattr(self.graphiti, 'driver', None) or getattr(self.graphiti, '_driver', None)
-                if driver is not None:
+            driver = await self._get_driver()
+            if driver is not None:
                     records, _, _ = await driver.execute_query(
                         """
                         MATCH (e)
@@ -1992,8 +1981,41 @@ class SynapseService:
         if self.graphiti is None:
             return None
         # graphiti_core stores the driver as _driver or graph_driver
-        driver = getattr(self.graphiti, '_driver', None) or getattr(self.graphiti, 'driver', None)
-        return driver
+        graphiti_dict = getattr(self.graphiti, "__dict__", {})
+        driver = (
+            graphiti_dict.get("_driver")
+            or graphiti_dict.get("driver")
+            or getattr(self.graphiti, "_driver", None)
+            or getattr(self.graphiti, "driver", None)
+        )
+        return bind_graph_driver(driver, database=self._graph_runtime.canonical_database)
+
+    def _get_bound_graphiti_client(self):
+        """Return an isolated Graphiti client pinned to the canonical graph database."""
+        return bind_graphiti_client(
+            self.graphiti,
+            database=self._graph_runtime.canonical_database,
+        )
+
+    async def _emit_service_event(
+        self,
+        event_type: FeedEventType,
+        *,
+        summary: str,
+        detail: Optional[Dict[str, Any]] = None,
+        layer: Optional[str] = None,
+    ) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            await self._event_bus.emit(
+                event_type=event_type,
+                summary=summary,
+                layer=layer,
+                detail=detail or {},
+            )
+        except Exception:
+            logger.debug("Failed to emit service event %s", summary)
 
     async def search_nodes(
         self,
@@ -2032,7 +2054,12 @@ class SynapseService:
 
                 if not records and self.graphiti is not None:
                     # Fall back to Graphiti edge search when direct node lookup has no hit.
-                    search_results = await self.graphiti.search(query=query, num_results=limit)
+                    graphiti_client = self._get_bound_graphiti_client()
+                    search_results = (
+                        await graphiti_client.search(query=query, num_results=limit)
+                        if graphiti_client is not None
+                        else []
+                    )
                     node_uuids = set()
                     for edge in search_results:
                         node_uuids.add(edge.source_node_uuid)
@@ -2747,59 +2774,140 @@ class SynapseService:
 
     async def get_status(self) -> Dict[str, Any]:
         """Get system status with real component health checks."""
-        components = {}
-        overall_status = "ok"
+        components: Dict[str, Dict[str, Any]] = {}
+        overall_status = "healthy"
+
+        def add_component(
+            name: str,
+            status: str,
+            *,
+            message: Optional[str] = None,
+            details: Optional[Dict[str, Any]] = None,
+            latency_ms: Optional[float] = None,
+        ) -> None:
+            nonlocal overall_status
+            normalized = str(status).strip().lower() or "unknown"
+            components[name] = {
+                "status": normalized,
+                "message": message or normalized,
+                "details": details or {},
+            }
+            if latency_ms is not None:
+                components[name]["latency_ms"] = latency_ms
+            if normalized == "unhealthy":
+                overall_status = "unhealthy"
+            elif normalized in {"degraded", "unknown"} and overall_status == "healthy":
+                overall_status = "degraded"
 
         # Check Graphiti/FalkorDB
         driver = await self._get_driver()
         if driver:
+            started = perf_counter()
             try:
                 await driver.execute_query("RETURN 1 AS ping")
-                components["falkordb"] = "ok"
+                add_component(
+                    "falkordb",
+                    "healthy",
+                    message="ok",
+                    latency_ms=round((perf_counter() - started) * 1000, 2),
+                    details={"database": self._graph_runtime.canonical_database},
+                )
             except Exception as e:
-                components["falkordb"] = f"error: {e}"
-                overall_status = "degraded"
+                add_component(
+                    "falkordb",
+                    "degraded",
+                    message=f"error: {e}",
+                    latency_ms=round((perf_counter() - started) * 1000, 2),
+                    details={"database": self._graph_runtime.canonical_database},
+                )
         else:
-            components["falkordb"] = "not initialized"
-            overall_status = "degraded"
+            add_component(
+                "falkordb",
+                "degraded",
+                message="not initialized",
+                details={"database": self._graph_runtime.canonical_database},
+            )
 
         # Check layer manager
         try:
             self.layers.get_user(self.user_id)
-            components["layer_manager"] = "ok"
+            add_component("layer_manager", "healthy", message="ok")
         except Exception as e:
-            components["layer_manager"] = f"error: {e}"
-            overall_status = "degraded"
+            add_component("layer_manager", "degraded", message=f"error: {e}")
 
         # Check episodic DB
         try:
             self.layers.episodic.get_all_episodes(limit=1)
-            components["episodic_db"] = "ok"
+            add_component("episodic_db", "healthy", message="ok")
         except Exception as e:
-            components["episodic_db"] = f"error: {e}"
-            overall_status = "degraded"
+            add_component("episodic_db", "degraded", message=f"error: {e}")
 
         # Check procedural DB
         try:
             self.layers.procedural.get_all_procedures(limit=1)
-            components["procedural_db"] = "ok"
+            add_component("procedural_db", "healthy", message="ok")
         except Exception as e:
-            components["procedural_db"] = f"error: {e}"
-            overall_status = "degraded"
+            add_component("procedural_db", "degraded", message=f"error: {e}")
 
         try:
             outbox = self.layers.semantic.get_outbox_health()
-            unhealthy = [backend for backend, info in outbox.items() if info.get("unhealthy")]
-            components["hybrid_search"] = "ok" if not unhealthy else f"degraded: {', '.join(unhealthy)}"
-            if unhealthy:
-                overall_status = "degraded"
+            graph_info = outbox.get("graph", {})
+            vector_info = outbox.get("vector", {})
+            graph_pending = int(graph_info.get("pending_count", 0))
+            graph_failed = int(graph_info.get("failed_count", 0))
+            vector_pending = int(vector_info.get("pending_count", 0))
+            vector_failed = int(vector_info.get("failed_count", 0))
+            graph_status = "degraded" if graph_info.get("unhealthy") else "healthy"
+            vector_status = "degraded" if vector_info.get("unhealthy") else "healthy"
+            add_component(
+                "semantic_outbox_graph",
+                graph_status,
+                message=(
+                    "ok"
+                    if graph_status == "healthy"
+                    else (
+                        f"degraded: pending={graph_pending}, failed={graph_failed}, "
+                        f"dead_letter={int(graph_info.get('dead_letter_count', 0))}, "
+                        f"circuit={graph_info.get('circuit_state', 'closed')}"
+                    )
+                ),
+                details=graph_info,
+            )
+            add_component(
+                "semantic_outbox_vector",
+                vector_status,
+                message=(
+                    "ok"
+                    if vector_status == "healthy"
+                    else f"degraded: pending={vector_pending}, failed={vector_failed}"
+                ),
+                details=vector_info,
+            )
+            degraded_backends = [
+                backend
+                for backend, info in (("graph", graph_info), ("vector", vector_info))
+                if info.get("unhealthy")
+            ]
+            add_component(
+                "hybrid_search",
+                "healthy" if not degraded_backends else "degraded",
+                message="ok" if not degraded_backends else f"degraded: {', '.join(degraded_backends)}",
+                details={"degraded_backends": degraded_backends},
+            )
         except Exception as e:
-            components["hybrid_search"] = f"error: {e}"
-            overall_status = "degraded"
+            add_component("hybrid_search", "degraded", message=f"error: {e}")
+            add_component("semantic_outbox_graph", "degraded", message=f"error: {e}")
+            add_component("semantic_outbox_vector", "degraded", message=f"error: {e}")
 
         return {
             "status": overall_status,
-            "message": "All systems operational" if overall_status == "ok" else "Some components degraded",
+            "message": (
+                "All systems operational"
+                if overall_status == "healthy"
+                else "Graph projection degraded"
+                if components.get("semantic_outbox_graph", {}).get("status") == "degraded"
+                else "Some components degraded"
+            ),
             "components": components,
         }
 
@@ -2861,35 +2969,54 @@ class SynapseService:
         semantic_stats = self.layers.semantic.store.get_stats() if hasattr(self.layers.semantic, "store") else {}
 
         return {
-            "entities": entity_count,
-            "edges": edge_count,
-            "episodes": len(episodes) + graph_episode_count,
-            "procedures": len(procedures),
-            "episodic_items": len(episodes),
-            "working_keys": len(working_context),
+            "memory": {
+                "entities": entity_count,
+                "edges": edge_count,
+                "episodes": len(episodes) + graph_episode_count,
+                "procedures": len(procedures),
+                "episodic_items": len(episodes),
+                "working_keys": len(working_context),
+                "user_models": 1 if self.layers.get_user(self.user_id) is not None else 0,
+            },
             "storage": {
                 "falkordb_mb": 0.0,  # FalkorDB doesn't expose size easily
                 "qdrant_mb": 0.0,
                 "sqlite_mb": round(sqlite_mb, 2),
             },
-            "search": hybrid_metrics,
+            "search": {
+                "counts": hybrid_metrics.get("counts", {}),
+                "latency_ms": hybrid_metrics.get("latency_ms", {}),
+                "semantic_projection": semantic_stats,
+            },
             "semantic_projection": semantic_stats,
         }
 
     async def run_maintenance(self, action: str, dry_run: bool = False) -> Dict[str, Any]:
         """Run maintenance tasks with real effects."""
+        started = perf_counter()
         affected = 0
         message = ""
+        success = True
         normalized_action = str(action).strip().lower().replace("-", "_")
         action_aliases = {
             "decay_refresh": "decay_refresh",
             "purge_expired": "purge_expired",
             "vacuum_sqlite": "vacuum_sqlite",
             "rebuild_fts": "rebuild_fts",
+            "replay_semantic_outbox": "replay_semantic_outbox",
+            "rebuild_semantic_graph": "rebuild_semantic_graph",
+            "pause_graph_projection": "pause_graph_projection",
+            "resume_graph_projection": "resume_graph_projection",
+            "replay_dead_letter_graph": "replay_dead_letter_graph",
             "decayrefresh": "decay_refresh",
             "purgeexpired": "purge_expired",
             "vacuumsqlite": "vacuum_sqlite",
             "rebuildfts": "rebuild_fts",
+            "replaysemanticoutbox": "replay_semantic_outbox",
+            "rebuildsemanticgraph": "rebuild_semantic_graph",
+            "pausegraphprojection": "pause_graph_projection",
+            "resumegraphprojection": "resume_graph_projection",
+            "replaydeadlettergraph": "replay_dead_letter_graph",
         }
         normalized_action = action_aliases.get(normalized_action, normalized_action)
 
@@ -2905,6 +3032,7 @@ class SynapseService:
                     message = f"Refreshed decay scores for {affected} procedures"
             except Exception as e:
                 message = f"Decay refresh failed: {e}"
+                success = False
 
         elif normalized_action == "purge_expired":
             if not dry_run:
@@ -2914,6 +3042,7 @@ class SynapseService:
                     message = f"Purged {affected} expired episodes"
                 except Exception as e:
                     message = f"Purge failed: {e}"
+                    success = False
             else:
                 try:
                     episodes = self.layers.episodic.get_all_episodes(include_expired=True, limit=10000)
@@ -2925,6 +3054,7 @@ class SynapseService:
                     message = f"Would purge {affected} expired episodes"
                 except Exception as e:
                     message = f"Purge check failed: {e}"
+                    success = False
 
         elif normalized_action == "vacuum_sqlite":
             if not dry_run:
@@ -2940,6 +3070,7 @@ class SynapseService:
                     message = f"Vacuumed {affected} SQLite databases"
                 except Exception as e:
                     message = f"Vacuum failed: {e}"
+                    success = False
             else:
                 message = "Would vacuum all SQLite databases"
 
@@ -2947,12 +3078,106 @@ class SynapseService:
             message = "FTS rebuild completed"
             affected = 0
 
+        elif normalized_action == "replay_semantic_outbox":
+            try:
+                replay = self.layers.semantic.replay_due_outbox(dry_run=dry_run)
+                affected = int(replay.get("affected", 0))
+                details = []
+                for backend, info in replay.get("backends", {}).items():
+                    value = info.get("due_count", 0) if dry_run else info.get("attempted_count", 0)
+                    details.append(f"{backend}={value}")
+                verb = "Would replay" if dry_run else "Triggered replay for"
+                message = f"{verb} {affected} due semantic outbox tasks"
+                if details:
+                    message += f" ({', '.join(details)})"
+            except Exception as e:
+                message = f"Semantic outbox replay failed: {e}"
+                success = False
+
+        elif normalized_action == "rebuild_semantic_graph":
+            try:
+                rebuild = self.layers.semantic.rebuild_graph_projection(dry_run=dry_run)
+                affected = int(rebuild.get("affected", 0))
+                if rebuild.get("available") is False and not dry_run:
+                    message = str(rebuild.get("message") or "Graph rebuild unavailable")
+                else:
+                    verb = "Would rebuild" if dry_run else "Queued rebuild for"
+                    message = (
+                        f"{verb} {affected} semantic graph projection records "
+                        f"(nodes={rebuild.get('nodes', 0)}, edges={rebuild.get('edges', 0)})"
+                    )
+            except Exception as e:
+                message = f"Semantic graph rebuild failed: {e}"
+                success = False
+
+        elif normalized_action == "pause_graph_projection":
+            try:
+                if dry_run:
+                    current = self.layers.semantic.store.get_projector_state("graph")
+                    affected = 1
+                    message = (
+                        "Would pause graph projection "
+                        f"(current_state={current.get('circuit_state', 'closed')})"
+                    )
+                else:
+                    result = self.layers.semantic.pause_graph_projection()
+                    affected = int(result.get("affected", 0))
+                    message = "Paused graph projection"
+            except Exception as e:
+                message = f"Pause graph projection failed: {e}"
+                success = False
+
+        elif normalized_action == "resume_graph_projection":
+            try:
+                if dry_run:
+                    current = self.layers.semantic.store.get_projector_state("graph")
+                    affected = 1
+                    message = (
+                        "Would resume graph projection "
+                        f"(current_state={current.get('circuit_state', 'closed')})"
+                    )
+                else:
+                    result = self.layers.semantic.resume_graph_projection()
+                    affected = int(result.get("affected", 0))
+                    message = "Resumed graph projection"
+            except Exception as e:
+                message = f"Resume graph projection failed: {e}"
+                success = False
+
+        elif normalized_action == "replay_dead_letter_graph":
+            try:
+                replay = self.layers.semantic.replay_dead_letter_graph(dry_run=dry_run)
+                affected = int(replay.get("affected", 0))
+                verb = "Would requeue" if dry_run else "Requeued"
+                message = f"{verb} {affected} graph dead-letter tasks"
+            except Exception as e:
+                message = f"Dead-letter graph replay failed: {e}"
+                success = False
+
         else:
             message = f"Unknown maintenance action: {action}"
+            success = False
+
+        duration_ms = round((perf_counter() - started) * 1000, 2)
+        if success and self._event_bus is not None:
+            await self._emit_service_event(
+                FeedEventType.MAINTENANCE,
+                summary=message,
+                layer=MemoryLayer.SEMANTIC.value,
+                detail={
+                    "action": normalized_action,
+                    "affected": affected,
+                    "dry_run": dry_run,
+                    "success": success,
+                    "duration_ms": duration_ms,
+                },
+            )
 
         return {
             "action": normalized_action,
             "affected": affected,
             "dry_run": dry_run,
             "message": message,
+            "success": success,
+            "duration_ms": duration_ms,
         }

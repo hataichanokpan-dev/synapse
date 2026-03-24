@@ -18,6 +18,40 @@ def test_auth_enforcement(client):
     assert client.get("/api/memory/", headers={"X-API-Key": "wrong"}).status_code == 401
 
 
+def test_cors_preflight_returns_ok_before_auth(client):
+    response = client.options(
+        "/api/feed/",
+        headers={
+            "Origin": "http://localhost:7533",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "X-API-Key",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:7533"
+    assert "GET" in response.headers["access-control-allow-methods"]
+
+
+def test_auth_error_keeps_cors_headers_for_browser_clients(client):
+    response = client.get(
+        "/api/feed/",
+        headers={
+            "Origin": "http://localhost:7533",
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.headers["access-control-allow-origin"] == "http://localhost:7533"
+    assert response.json()["code"] == "AUTH_MISSING"
+
+
+def test_feed_route_accepts_api_key_query_param(client):
+    response = client.get("/api/feed/?api_key=synapse-dev-key")
+    assert response.status_code == 200
+    assert "events" in response.json()
+
+
 def test_memory_create_honors_forced_layer_and_returns_real_uuid(client, api_headers, synapse_service):
     response = client.post(
         "/api/memory/",
@@ -230,6 +264,21 @@ def test_preferences_round_trip_normalizes_response_style_and_length(client, api
     assert fetched["preferences"]["response_style"] == "auto"
     assert fetched["preferences"]["response_length"] == "detailed"
     assert fetched["preferences"]["topics"] == ["ai"]
+
+
+def test_preferences_reject_suspicious_question_mark_corruption(client, api_headers):
+    response = client.put(
+        "/api/identity/preferences",
+        headers=api_headers,
+        json={
+            "notes": "??????????????????????????? ?????????????? CPALL ADVANC BDMS",
+        },
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == "TEXT_ENCODING_SUSPECTED"
+    assert body["fields"] == ["notes"]
 
 
 def test_feed_history_works(client, api_headers):

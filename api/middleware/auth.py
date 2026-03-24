@@ -39,14 +39,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # Check API key
-        api_key = request.headers.get(settings.api_key_header)
+        api_key = request.headers.get(settings.api_key_header) or request.query_params.get("api_key")
 
         if not api_key:
             return UTF8JSONResponse(
                 status_code=401,
                 content={
                     "error": "Missing API key",
-                    "detail": f"Provide {settings.api_key_header} header",
+                    "detail": f"Provide {settings.api_key_header} header or api_key query parameter",
                     "code": "AUTH_MISSING",
                 },
             )

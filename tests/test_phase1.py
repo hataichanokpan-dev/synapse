@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 from synapse.services import SynapseService
 from synapse.services.synapse_service import SynapseService as SynapseServiceClass
+from synapse.graph_runtime import normalize_graph_group_id
 from synapse.layers import (
     LayerManager,
     MemoryLayer,
@@ -43,6 +44,19 @@ def mock_graphiti():
 def mock_layer_manager():
     """Create a mock LayerManager."""
     manager = MagicMock(spec=LayerManager)
+    manager.procedural = MagicMock()
+    manager.procedural.fetch_lexical_candidates = MagicMock(return_value=[])
+    manager.procedural.fetch_vector_candidates = MagicMock(return_value=[])
+    manager.episodic = MagicMock()
+    manager.episodic.fetch_lexical_candidates = MagicMock(return_value=[])
+    manager.episodic.fetch_vector_candidates = MagicMock(return_value=[])
+    manager.semantic = MagicMock()
+    manager.semantic.fetch_lexical_candidates = MagicMock(return_value=[])
+    manager.semantic.fetch_vector_candidates = MagicMock(return_value=[])
+    manager.semantic.get_outbox_health = MagicMock(return_value={})
+    manager.semantic._graphiti = None
+    manager.working = MagicMock()
+    manager.working.get_all_context = MagicMock(return_value={})
     manager.detect_layer = MagicMock(return_value=MemoryLayer.SEMANTIC)
     manager.add_entity = AsyncMock(return_value=SynapseNode(
         id="test_id",
@@ -63,6 +77,8 @@ def mock_layer_manager():
     manager.set_working = MagicMock()
     manager.update_user = MagicMock()
     manager.record_episode = MagicMock()
+    manager._search_working_memory = MagicMock(return_value=[])
+    manager._search_user_model = MagicMock(return_value=[])
     return manager
 
 
@@ -112,8 +128,7 @@ class TestSynapseService:
 
         assert "layer" in result
         assert result["layer"] in [layer.value for layer in MemoryLayer]
-        # Note: Graphiti add_episode may not be called if graphiti_core is not available
-        # but the layer classification should still work
+        mock_graphiti.add_episode.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_add_memory_procedural_content(self, synapse_service, mock_layer_manager):
@@ -142,18 +157,14 @@ class TestSynapseService:
     @pytest.mark.asyncio
     async def test_search_memory(self, synapse_service, mock_layer_manager, mock_graphiti):
         """Test search across memory layers."""
-        mock_layer_manager.search_all = AsyncMock(return_value={
-            MemoryLayer.SEMANTIC: [],
-            MemoryLayer.EPISODIC: [],
-        })
-
         result = await synapse_service.search_memory(
             query="test query",
             limit=10,
         )
 
-        assert "layers" in result
-        assert "graphiti" in result
+        assert "results" in result
+        assert "mode_used" in result
+        assert result["mode_used"] in {"legacy", "hybrid_auto", "hybrid_best_effort", "hybrid_strict"}
 
     @pytest.mark.asyncio
     async def test_add_entity(self, synapse_service, mock_layer_manager):
@@ -166,6 +177,11 @@ class TestSynapseService:
 
         assert entity is not None
         mock_layer_manager.add_entity.assert_called_once()
+
+    def test_graph_group_normalization_uses_global_default(self):
+        """Graph group IDs should normalize to a single default namespace."""
+        assert normalize_graph_group_id(None) == "global"
+        assert normalize_graph_group_id("Project Alpha") == "Project_Alpha"
 
     @pytest.mark.asyncio
     async def test_get_entity(self, synapse_service, mock_layer_manager):
@@ -234,8 +250,9 @@ class TestSynapseService:
             working_manager=WorkingManager(),
         )
 
-        graph_driver = AsyncMock()
-        graph_driver.execute_query.return_value = (
+        graph_driver = MagicMock()
+        graph_driver.clone.return_value = graph_driver
+        graph_driver.execute_query = AsyncMock(return_value=(
             [
                 {
                     "uuid": "graph-sem-1",
@@ -253,9 +270,10 @@ class TestSynapseService:
             ],
             None,
             None,
-        )
+        ))
         graphiti_client = MagicMock()
         graphiti_client.driver = graph_driver
+        graphiti_client._driver = graph_driver
 
         service = SynapseService(
             graphiti_client=graphiti_client,
@@ -287,7 +305,7 @@ class TestSemanticLayerPersistence:
     """Tests for Semantic Layer FalkorDB persistence."""
 
     @pytest.fixture
-    def semantic_manager(self, mock_graphiti):
+    def semantic_manager(self, mock_graphiti, tmp_path):
         """Create a SemanticManager with mock Graphiti."""
         from synapse.layers.semantic import SemanticManager
 
@@ -298,12 +316,16 @@ class TestSemanticLayerPersistence:
             mock_qdrant.search = MagicMock(return_value=[])
             MockQdrant.return_value = mock_qdrant
 
-            manager = SemanticManager(graphiti_client=mock_graphiti)
+            manager = SemanticManager(
+                graphiti_client=mock_graphiti,
+                db_path=tmp_path / "semantic.db",
+            )
+            manager._submit_outbox_worker = MagicMock()
             return manager
 
     @pytest.mark.asyncio
-    async def test_add_entity_persists_to_graphiti(self, semantic_manager, mock_graphiti):
-        """Test that add_entity persists to Graphiti."""
+    async def test_add_entity_queues_graph_projection(self, semantic_manager, mock_graphiti):
+        """Test that add_entity queues graph projection durably."""
         entity = await semantic_manager.add_entity(
             name="Python",
             entity_type=EntityType.TECH,
@@ -312,11 +334,14 @@ class TestSemanticLayerPersistence:
 
         assert entity is not None
         assert entity.name == "Python"
-        mock_graphiti.add_episode.assert_called_once()
+        pending = semantic_manager.store.fetch_pending_outbox(target_backend="graph", limit=10)
+        assert len(pending) == 1
+        assert pending[0]["op_type"] == "add_entity"
+        assert mock_graphiti.add_episode.await_count == 0
 
     @pytest.mark.asyncio
-    async def test_add_fact_persists_to_graphiti(self, semantic_manager, mock_graphiti):
-        """Test that add_fact persists to Graphiti."""
+    async def test_add_fact_queues_graph_projection(self, semantic_manager, mock_graphiti):
+        """Test that add_fact queues graph projection durably."""
         edge = await semantic_manager.add_fact(
             source_id="entity_1",
             target_id="entity_2",
@@ -326,7 +351,10 @@ class TestSemanticLayerPersistence:
         assert edge is not None
         assert edge.source_id == "entity_1"
         assert edge.target_id == "entity_2"
-        mock_graphiti.add_episode.assert_called_once()
+        pending = semantic_manager.store.fetch_pending_outbox(target_backend="graph", limit=10)
+        assert len(pending) == 1
+        assert pending[0]["op_type"] == "add_fact"
+        assert mock_graphiti.add_episode.await_count == 0
 
     @pytest.mark.asyncio
     async def test_get_entity_returns_data(self, semantic_manager):

@@ -47,10 +47,13 @@ python scripts/pre_deploy_smoke.py --base-url http://127.0.0.1:8000 --api-key "$
 - [ ] `DEBUG` is set to a production-safe value such as `false`, `off`, `prod`, `production`, or `release`.
 - [ ] `SYNAPSE_API_KEY` is set and is not the default development key.
 - [ ] `CORS_ORIGINS` only includes approved origins.
-- [ ] Persistent storage for `~/.synapse` or the configured SQLite path is mounted and backed up.
+- [ ] Persistent storage for the runtime SQLite path is mounted and backed up. Docker deployments use `/app/.synapse` as the truth store; host `~/.synapse` is not authoritative unless mounted there.
 - [ ] Required secrets are present for the chosen backend mode.
 - [ ] `SYNAPSE_ENABLE_GRAPHITI` is explicitly set for this environment.
 - [ ] `SYNAPSE_ENABLE_QDRANT` is explicitly set for this environment.
+- [ ] `GRAPH_CANONICAL_DATABASE` matches the intended production FalkorDB database and is the only graph database read by the API/UI.
+- [ ] `GRAPH_DEFAULT_GROUP_ID` is pinned to the app default (`global`) for request metadata normalization.
+- [ ] Graph projector controls are set explicitly: `GRAPH_PROJECTION_MAX_INFLIGHT`, `GRAPH_PROJECTION_MIN_INTERVAL_SECONDS`, `GRAPH_PROJECTION_COOLDOWN_SECONDS`, `GRAPH_PROJECTION_MAX_RETRIES`, and `GRAPH_PROJECTION_LEASE_TIMEOUT_SECONDS`.
 
 ## Backend Readiness
 
@@ -73,8 +76,11 @@ python scripts/pre_deploy_smoke.py --base-url http://127.0.0.1:8000 --api-key "$
 - [ ] Procedure success recording increments `success_count`.
 - [ ] Preferences update/get round-trips canonical values for `response_style` and `response_length`.
 - [ ] Maintenance dry-run succeeds for at least `purge_expired`.
+- [ ] Maintenance dry-run succeeds for `replay_semantic_outbox` and `rebuild_semantic_graph` when semantic recovery tooling is required.
+- [ ] Maintenance dry-run succeeds for `pause_graph_projection`, `resume_graph_projection`, and `replay_dead_letter_graph` in graph-enabled environments.
 - [ ] Feed history loads without datetime errors.
 - [ ] Feed SSE stream returns the initial `connected` event.
+- [ ] Feed SSE stream emits graph projector lifecycle events when semantic graph writes are exercised.
 - [ ] Graph endpoints return `503` when graph driver is unavailable instead of false success.
 
 ## Staging-Only Checks
@@ -97,6 +103,8 @@ Run these in staging or an isolated environment, not against live production dat
 
 - [ ] Run `python scripts/pre_deploy_smoke.py --base-url <prod-url> --api-key <prod-key> --require-graph --output-json artifacts/post_deploy_smoke.json` after rollout if graph is required.
 - [ ] Confirm `/health` and `/api/system/status` remain stable for at least one observation window.
+- [ ] Confirm `semantic_outbox_graph` and `semantic_outbox_vector` in `/api/system/status` reflect the real backend state.
+- [ ] Confirm `/api/system/stats.search.semantic_projection.outbox.graph` shows sane `circuit_state`, `due_count`, `dead_letter_count`, `last_projected_at`, and `provider_last_429_at` values.
 - [ ] Review application logs for auth failures, Graphiti write errors, and SQLite errors.
 - [ ] Confirm feed activity appears for real traffic after deploy.
 

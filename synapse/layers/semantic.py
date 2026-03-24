@@ -19,13 +19,21 @@ import asyncio
 import json
 import os
 import logging
+import random
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from uuid import uuid4
 
+from api.services.event_bus import FeedEventType
+from synapse.graph_runtime import (
+    bind_graphiti_client,
+    load_graph_projection_runtime_config,
+    normalize_graph_group_id,
+)
 from synapse.storage import QdrantClient
 from synapse.graphiti.errors import (
     GraphitiWriteError,
@@ -47,6 +55,9 @@ from .semantic_store import SemanticProjectionStore, DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
 DEFAULT_COLLECTION_NAME = "semantic_memory"
+_OUTBOX_POLL_INTERVAL_SECONDS = 30.0
+_GRAPH_RATE_LIMIT_BACKOFFS = (300, 600, 1200, 2400, 3600)
+_DEFAULT_OUTBOX_BACKENDS = ("vector", "graph")
 
 # Environment variable to require Graphiti in production
 # When true, Graphiti write failures will raise exceptions instead of silent warnings
@@ -75,11 +86,7 @@ def _get_nlp_preprocessor():
 
 def _sanitize_graph_group_id(group_id: Optional[str]) -> str:
     """Sanitize group IDs for Graphiti/FalkorDB compatibility."""
-    if group_id is None:
-        return "semantic"
-    sanitized = re.sub(r"[^A-Za-z0-9_]+", "_", str(group_id).strip())
-    sanitized = sanitized.strip("_")
-    return sanitized or "semantic"
+    return normalize_graph_group_id(group_id)
 
 
 class SemanticManager:
@@ -107,12 +114,31 @@ class SemanticManager:
         self.collection_name = collection_name
         self._initialized = False
         self._vector_warning_emitted = False
+        self._runtime_config = load_graph_projection_runtime_config()
         self.store = SemanticProjectionStore(db_path or DEFAULT_DB_PATH)
         self._outbox_threads: Dict[str, threading.Thread] = {}
+        self._outbox_wake_events: Dict[str, threading.Event] = {}
+        self._outbox_stop_event = threading.Event()
+        self._outbox_poll_interval = _OUTBOX_POLL_INTERVAL_SECONDS
+        self._lease_owner = f"semantic-projector-{uuid4()}"
+        self._event_bus = None
+        self._backend_next_allowed_at: Dict[str, float] = {
+            "graph": 0.0,
+            "vector": 0.0,
+        }
         try:
             self._app_loop = asyncio.get_running_loop()
         except RuntimeError:
             self._app_loop = None
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Attach the API event bus for graph projection lifecycle events."""
+        self._event_bus = event_bus
+        if self._app_loop is None:
+            try:
+                self._app_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._app_loop = None
 
     async def _ensure_graphiti(self, require: bool = False) -> bool:
         """Ensure Graphiti client is initialized when available."""
@@ -146,7 +172,10 @@ class SemanticManager:
             return False
         try:
             # Try a simple search to verify connection
-            await self._graphiti.search(query="__health_check__", num_results=1)
+            graphiti_client = self._bound_graphiti_client()
+            if graphiti_client is None:
+                return False
+            await graphiti_client.search(query="__health_check__", num_results=1)
             return True
         except Exception as e:
             logger.warning(f"Graphiti connection check failed: {e}")
@@ -196,30 +225,267 @@ class SemanticManager:
             op_type=op_type,
             payload=payload,
             dedupe_key=dedupe_key,
+            projector_version=self._runtime_config.projector_version,
         )
+        if target_backend == "graph":
+            self._emit_projection_event(
+                FeedEventType.GRAPH_PROJECTION_QUEUED,
+                summary="Graph projection queued",
+                detail={
+                    "backend": "graph",
+                    "operation_id": operation_id,
+                    "record_id": record_id,
+                    "op_type": op_type,
+                },
+            )
         self._submit_outbox_worker(target_backend)
 
+    def start_background_processing(self, poll_interval: float = _OUTBOX_POLL_INTERVAL_SECONDS) -> None:
+        """Start persistent outbox processors for all known backends."""
+        self._outbox_poll_interval = max(1.0, float(poll_interval))
+        if self._outbox_stop_event.is_set():
+            self._outbox_stop_event = threading.Event()
+        for backend in _DEFAULT_OUTBOX_BACKENDS:
+            self._submit_outbox_worker(backend)
+
+    def stop_background_processing(self, join_timeout: float = 2.0) -> None:
+        """Stop persistent outbox processors."""
+        self._outbox_stop_event.set()
+        for wake_event in self._outbox_wake_events.values():
+            wake_event.set()
+
+        current_thread = threading.current_thread()
+        for backend, thread in list(self._outbox_threads.items()):
+            if thread.is_alive() and thread is not current_thread:
+                thread.join(timeout=join_timeout)
+            self._outbox_threads.pop(backend, None)
+
+        self._outbox_wake_events.clear()
+        self._outbox_stop_event = threading.Event()
+
     def _submit_outbox_worker(self, target_backend: str) -> None:
-        """Start a best-effort outbox worker for a backend."""
+        """Start or wake a persistent outbox worker for a backend."""
+        wake_event = self._outbox_wake_events.setdefault(target_backend, threading.Event())
         thread = self._outbox_threads.get(target_backend)
         if thread is not None and thread.is_alive():
+            wake_event.set()
             return
         thread = threading.Thread(
-            target=self._drain_outbox_backend,
+            target=self._outbox_worker_loop,
             args=(target_backend,),
             daemon=True,
             name=f"semantic-outbox-{target_backend}",
         )
         self._outbox_threads[target_backend] = thread
         thread.start()
+        wake_event.set()
 
-    def _drain_outbox_backend(self, target_backend: str) -> None:
-        """Best-effort outbox worker."""
-        rows = self.store.fetch_pending_outbox(target_backend=target_backend, limit=20)
+    def _graph_projection_group_id(self, group_id: Optional[str]) -> str:
+        """Collapse projection writes into the canonical graph namespace."""
+        _ = _sanitize_graph_group_id(group_id)
+        return self._runtime_config.canonical_database
+
+    def _bound_graphiti_client(self):
+        """Return an isolated Graphiti client pinned to the canonical graph database."""
+        return bind_graphiti_client(
+            self._graphiti,
+            database=self._runtime_config.canonical_database,
+        )
+
+    def _emit_projection_event(
+        self,
+        event_type: FeedEventType,
+        *,
+        summary: str,
+        detail: Optional[Dict[str, Any]] = None,
+        layer: str = MemoryLayer.SEMANTIC.value,
+    ) -> None:
+        """Emit projector lifecycle events on the API event bus when available."""
+        if self._event_bus is None:
+            return
+        coro = self._event_bus.emit(
+            event_type=event_type,
+            summary=summary,
+            layer=layer,
+            detail=detail or {},
+        )
+        app_loop = self._app_loop
+        if app_loop is not None and not app_loop.is_closed():
+            future = asyncio.run_coroutine_threadsafe(coro, app_loop)
+            try:
+                future.result(timeout=5)
+            except Exception:
+                logger.debug("Projection event emit timed out for %s", summary)
+            return
+        try:
+            asyncio.run(coro)
+        except Exception:
+            logger.debug("Projection event emit failed for %s", summary)
+
+    def _update_projector_state(self, backend: str, **fields: Any) -> Dict[str, Any]:
+        return self.store.update_projector_state(backend, **fields)
+
+    def _open_graph_circuit(self, reason: str, *, error_code: str, last_error: str) -> None:
+        cooldown_until = datetime.fromtimestamp(
+            utcnow().timestamp() + self._runtime_config.cooldown_seconds,
+            tz=utcnow().tzinfo,
+        ).isoformat()
+        current = self.store.get_projector_state("graph")
+        failure_streak = int(current.get("failure_streak") or 0) + 1
+        updated = self._update_projector_state(
+            "graph",
+            circuit_state="paused_by_rate_limit",
+            cooldown_until=cooldown_until,
+            pause_reason=reason,
+            last_error_code=error_code,
+            provider_last_429_at=utcnow().isoformat() if error_code == "RATE_LIMIT" else current.get("provider_last_429_at"),
+            last_error=last_error[:500],
+            failure_streak=failure_streak,
+        )
+        self._emit_projection_event(
+            FeedEventType.GRAPH_CIRCUIT_OPEN,
+            summary="Graph projection paused by rate limit",
+            detail={
+                "backend": "graph",
+                "reason": reason,
+                "cooldown_until": updated.get("cooldown_until"),
+                "last_error_code": error_code,
+            },
+        )
+
+    def _close_graph_circuit(self, *, summary: str = "Graph projection resumed") -> None:
+        updated = self._update_projector_state(
+            "graph",
+            circuit_state="closed",
+            cooldown_until=None,
+            pause_reason=None,
+            failure_streak=0,
+            last_error=None,
+        )
+        self._emit_projection_event(
+            FeedEventType.GRAPH_CIRCUIT_CLOSED,
+            summary=summary,
+            detail={
+                "backend": "graph",
+                "circuit_state": updated.get("circuit_state"),
+                "last_projected_at": updated.get("last_projected_at"),
+            },
+        )
+
+    def pause_graph_projection(self) -> Dict[str, Any]:
+        updated = self._update_projector_state(
+            "graph",
+            circuit_state="paused_manual",
+            pause_reason="manual_maintenance",
+            cooldown_until=None,
+        )
+        return {"affected": 1, "state": updated}
+
+    def resume_graph_projection(self) -> Dict[str, Any]:
+        self._close_graph_circuit(summary="Graph projection resumed manually")
+        self._submit_outbox_worker("graph")
+        return {"affected": 1, "state": self.store.get_projector_state("graph")}
+
+    def replay_dead_letter_graph(self, *, dry_run: bool = False) -> Dict[str, Any]:
+        count = self.store.count_outbox_rows(target_backend="graph", statuses=("dead_letter",))
+        if dry_run:
+            return {"affected": count, "dry_run": True}
+        affected = self.store.requeue_outbox_rows(
+            target_backend="graph",
+            source_status="dead_letter",
+            reset_retry_count=True,
+        )
+        if affected:
+            self._submit_outbox_worker("graph")
+        return {"affected": affected, "dry_run": False}
+
+    def _outbox_worker_loop(self, target_backend: str) -> None:
+        """Continuously drain due outbox work for one backend."""
+        wake_event = self._outbox_wake_events.setdefault(target_backend, threading.Event())
+        while not self._outbox_stop_event.is_set():
+            processed = self._drain_outbox_backend(target_backend, limit=20)
+            if processed > 0:
+                continue
+            wake_event.wait(timeout=self._outbox_poll_interval)
+            wake_event.clear()
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        """Return True when an exception looks like a provider rate limit."""
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return "429" in text or "rate limit" in text or "too many requests" in text
+
+    def _classify_outbox_error(self, exc: Exception) -> Dict[str, str]:
+        text = f"{type(exc).__name__}: {exc}".lower()
+        if self._is_rate_limit_error(exc):
+            return {"error_code": "RATE_LIMIT", "error_class": "transient"}
+        if "timeout" in text or "timed out" in text or "deadline" in text:
+            return {"error_code": "TIMEOUT", "error_class": "transient"}
+        if "unavailable" in text or "connection" in text or "refused" in text:
+            return {"error_code": "UPSTREAM_UNAVAILABLE", "error_class": "transient"}
+        if isinstance(exc, (ValueError, TypeError, KeyError, json.JSONDecodeError)):
+            return {"error_code": "INVALID_PAYLOAD", "error_class": "permanent"}
+        if isinstance(exc, GraphitiNotInitializedError):
+            return {"error_code": "GRAPHITI_UNAVAILABLE", "error_class": "transient"}
+        return {"error_code": "UNKNOWN", "error_class": "transient"}
+
+    def _calculate_outbox_retry_delay(self, target_backend: str, exc: Exception, retry_count: int) -> int:
+        """Compute retry delay for an outbox failure."""
+        if target_backend == "graph" and self._is_rate_limit_error(exc):
+            base_delay = _GRAPH_RATE_LIMIT_BACKOFFS[min(max(retry_count - 1, 0), len(_GRAPH_RATE_LIMIT_BACKOFFS) - 1)]
+            return base_delay + random.randint(0, 15)
+        return min(300, max(15, 15 * (2 ** min(retry_count, 4))))
+
+    def _graph_circuit_allows_work(self) -> bool:
+        state = self.store.get_projector_state("graph")
+        circuit_state = str(state.get("circuit_state") or "closed")
+        if circuit_state == "paused_manual":
+            return False
+        if circuit_state != "paused_by_rate_limit":
+            return True
+        cooldown_until = self._parse_datetime(state.get("cooldown_until"))
+        if cooldown_until is None or utcnow() >= cooldown_until:
+            self._update_projector_state(
+                "graph",
+                circuit_state="half_open",
+                pause_reason="canary_probe",
+            )
+            return True
+        return False
+
+    def _respect_projection_interval(self, target_backend: str) -> bool:
+        if target_backend != "graph":
+            return True
+        now = time.monotonic()
+        return now >= self._backend_next_allowed_at.get(target_backend, 0.0)
+
+    def _mark_projection_attempt(self, target_backend: str) -> None:
+        if target_backend != "graph":
+            return
+        self._backend_next_allowed_at[target_backend] = time.monotonic() + self._runtime_config.min_interval_seconds
+
+    def _drain_outbox_backend(self, target_backend: str, limit: int = 20) -> int:
+        """Lease and project due outbox rows for one backend."""
+        self.store.release_expired_leases(
+            target_backend=target_backend,
+            lease_timeout_seconds=self._runtime_config.lease_timeout_seconds,
+        )
+        if target_backend == "graph" and not self._graph_circuit_allows_work():
+            return 0
+        if not self._respect_projection_interval(target_backend):
+            return 0
+        lease_limit = min(limit, self._runtime_config.max_inflight) if target_backend == "graph" else limit
+        rows = self.store.lease_due_outbox(
+            target_backend=target_backend,
+            lease_owner=self._lease_owner,
+            limit=max(1, lease_limit),
+            lease_timeout_seconds=self._runtime_config.lease_timeout_seconds,
+        )
+        processed = 0
         for row in rows:
             operation_id = row["operation_id"]
             retry_count = int(row["retry_count"] or 0)
             payload = json.loads(row["payload_json"] or "{}")
+            self._mark_projection_attempt(target_backend)
             try:
                 if target_backend == "vector":
                     self._apply_vector_payload(payload)
@@ -228,12 +494,90 @@ class SemanticManager:
                 else:
                     continue
                 self.store.mark_outbox_success(operation_id)
+                if target_backend == "graph":
+                    previous_state = str(self.store.get_projector_state("graph").get("circuit_state") or "closed")
+                    self._update_projector_state(
+                        "graph",
+                        circuit_state="closed",
+                        cooldown_until=None,
+                        pause_reason=None,
+                        last_projected_at=utcnow().isoformat(),
+                        failure_streak=0,
+                        last_error=None,
+                    )
+                    if previous_state == "half_open":
+                        self._close_graph_circuit(summary="Graph projection canary succeeded")
+                    self._emit_projection_event(
+                        FeedEventType.GRAPH_PROJECTION_COMPLETED,
+                        summary="Graph projection completed",
+                        detail={
+                            "backend": "graph",
+                            "operation_id": operation_id,
+                            "record_id": row["record_id"],
+                            "op_type": row["op_type"],
+                        },
+                    )
             except Exception as exc:
+                classification = self._classify_outbox_error(exc)
+                delay_seconds = self._calculate_outbox_retry_delay(target_backend, exc, retry_count + 1)
                 if target_backend == "vector":
                     self._warn_vector_issue(exc)
+                    self.store.mark_outbox_retry(
+                        operation_id,
+                        str(exc),
+                        retry_count + 1,
+                        delay_seconds=delay_seconds,
+                        error_code=classification["error_code"],
+                        error_class=classification["error_class"],
+                    )
                 else:
                     logger.warning("Semantic graph outbox failure: %s", exc)
-                self.store.mark_outbox_failure(operation_id, str(exc), retry_count + 1)
+                    if classification["error_class"] == "permanent" or retry_count + 1 >= self._runtime_config.max_retries:
+                        self.store.mark_outbox_dead_letter(
+                            operation_id,
+                            str(exc),
+                            retry_count + 1,
+                            error_code=classification["error_code"],
+                            error_class=classification["error_class"],
+                        )
+                    else:
+                        self.store.mark_outbox_retry(
+                            operation_id,
+                            str(exc),
+                            retry_count + 1,
+                            delay_seconds=delay_seconds,
+                            error_code=classification["error_code"],
+                            error_class=classification["error_class"],
+                        )
+                    current_state = self.store.get_projector_state("graph")
+                    failure_streak = int(current_state.get("failure_streak") or 0) + 1
+                    self._update_projector_state(
+                        "graph",
+                        last_error_code=classification["error_code"],
+                        last_error=str(exc)[:500],
+                        failure_streak=failure_streak,
+                    )
+                    if classification["error_code"] == "RATE_LIMIT":
+                        self._open_graph_circuit(
+                            "provider_rate_limit",
+                            error_code=classification["error_code"],
+                            last_error=str(exc),
+                        )
+                    self._emit_projection_event(
+                        FeedEventType.GRAPH_PROJECTION_FAILED,
+                        summary="Graph projection failed",
+                        detail={
+                            "backend": "graph",
+                            "operation_id": operation_id,
+                            "record_id": row["record_id"],
+                            "op_type": row["op_type"],
+                            "error_code": classification["error_code"],
+                            "error_class": classification["error_class"],
+                            "retry_count": retry_count + 1,
+                        },
+                    )
+            processed += 1
+        return processed
 
     def _apply_vector_payload(self, payload: Dict[str, Any]) -> None:
         """Apply a vector outbox payload."""
@@ -255,22 +599,24 @@ class SemanticManager:
 
     def _apply_graph_payload(self, payload: Dict[str, Any]) -> None:
         """Apply a graph outbox payload."""
-        if payload.get("op_type") == "add_entity":
+        if self._graphiti is None:
+            raise GraphitiNotInitializedError("semantic_graph_outbox")
+        op_type = str(payload.get("op_type") or "")
+        if op_type in {"add_entity", "add_fact", "graph_event", "invalidate_fact", "update_entity"}:
             self._run_graph_coroutine(
                 self._persist_graphiti_episode(
                     name=str(payload.get("graph_name") or f"entity_{payload.get('name', 'semantic')}"),
                     episode_body=str(payload.get("episode_body") or ""),
-                    source_description=str(payload.get("source_description") or "Entity"),
-                    reference_time=self._parse_datetime(payload.get("created_at")) or utcnow(),
-                )
-            )
-        elif payload.get("op_type") == "add_fact":
-            self._run_graph_coroutine(
-                self._persist_graphiti_episode(
-                    name=str(payload.get("graph_name") or f"fact_{payload.get('id', 'semantic')}"),
-                    episode_body=str(payload.get("episode_body") or ""),
-                    source_description=str(payload.get("source_description") or "Fact"),
-                    reference_time=self._parse_datetime(payload.get("valid_at")) or utcnow(),
+                    source_description=str(
+                        payload.get("source_description")
+                        or ("Fact" if op_type == "add_fact" else "Entity")
+                    ),
+                    reference_time=(
+                        self._parse_datetime(payload.get("created_at"))
+                        or self._parse_datetime(payload.get("valid_at"))
+                        or utcnow()
+                    ),
+                    group_id=payload.get("group_id"),
                 )
             )
 
@@ -306,12 +652,18 @@ class SemanticManager:
                 raise GraphitiNotInitializedError("semantic_graph_persist")
             return
 
-        await self._graphiti.add_episode(
+        graphiti_client = self._bound_graphiti_client()
+        if graphiti_client is None:
+            if _REQUIRE_GRAPHITI:
+                raise GraphitiNotInitializedError("semantic_graph_persist")
+            return
+
+        await graphiti_client.add_episode(
             name=name,
             episode_body=episode_body,
             source_description=source_description,
             reference_time=reference_time or utcnow(),
-            group_id=_sanitize_graph_group_id(group_id),
+            group_id=self._graph_projection_group_id(group_id),
         )
 
     def _index_entity(self, node: SynapseNode) -> bool:
@@ -456,7 +808,8 @@ class SemanticManager:
         query_type: str = "mixed",
     ) -> List[Dict[str, Any]]:
         """Fetch graph-derived semantic candidates."""
-        driver = getattr(self._graphiti, "driver", None) or getattr(self._graphiti, "_driver", None)
+        graphiti_client = self._bound_graphiti_client()
+        driver = getattr(graphiti_client, "driver", None) or getattr(graphiti_client, "_driver", None)
         if driver is None:
             return []
 
@@ -485,9 +838,9 @@ class SemanticManager:
                 logger.debug("Seeded graph fetch failed: %s", exc)
                 records = []
 
-        if not records and self._graphiti is not None:
+        if not records and graphiti_client is not None:
             try:
-                graph_results = await self._graphiti.search(query=query, num_results=limit)
+                graph_results = await graphiti_client.search(query=query, num_results=limit)
             except Exception as exc:
                 logger.debug("Graphiti search failed: %s", exc)
                 graph_results = []
@@ -564,6 +917,125 @@ class SemanticManager:
         """Expose semantic outbox health for system stats."""
         return self.store.get_outbox_health()
 
+    def replay_due_outbox(
+        self,
+        *,
+        target_backend: Optional[str] = None,
+        limit_per_backend: int = 100,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Replay due outbox rows immediately."""
+        requested_backends = [target_backend] if target_backend else (self.store.list_outbox_backends() or list(_DEFAULT_OUTBOX_BACKENDS))
+        summary: Dict[str, Dict[str, int]] = {}
+        total_affected = 0
+
+        for backend in requested_backends:
+            due_count = self.store.count_outbox_rows(
+                target_backend=backend,
+                statuses=("pending", "retry_wait", "failed"),
+                due_only=True,
+            )
+            attempted = 0
+            if not dry_run:
+                remaining = max(0, int(limit_per_backend))
+                while remaining > 0:
+                    processed = self._drain_outbox_backend(backend, limit=min(20, remaining))
+                    if processed == 0:
+                        break
+                    attempted += processed
+                    remaining -= processed
+            summary[backend] = {
+                "due_count": due_count,
+                "attempted_count": attempted,
+            }
+            total_affected += due_count if dry_run else attempted
+
+        return {
+            "affected": total_affected,
+            "dry_run": dry_run,
+            "backends": summary,
+        }
+
+    def rebuild_graph_projection(
+        self,
+        *,
+        dry_run: bool = False,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Re-enqueue graph projection tasks from SQLite semantic truth."""
+        nodes = self.store.fetch_graph_rebuild_nodes(limit=limit)
+        remaining = None if limit is None else max(0, limit - len(nodes))
+        edges = self.store.fetch_graph_rebuild_edges(limit=remaining)
+
+        if dry_run:
+            return {
+                "available": self._graphiti is not None,
+                "affected": len(nodes) + len(edges),
+                "nodes": len(nodes),
+                "edges": len(edges),
+                "dry_run": True,
+            }
+
+        if self._graphiti is None and not _REQUIRE_GRAPHITI:
+            return {
+                "available": False,
+                "affected": 0,
+                "nodes": len(nodes),
+                "edges": len(edges),
+                "dry_run": False,
+                "message": "Graphiti client not initialized",
+            }
+
+        for row in nodes:
+            payload = {
+                "id": row["id"],
+                "op_type": "add_entity",
+                "name": row["name"],
+                "graph_name": f"entity_{row['name']}",
+                "episode_body": f"{row['name']}: {row['summary'] or ''}",
+                "source_description": f"Entity type: {row['entity_type']}",
+                "created_at": row["created_at"],
+                "group_id": _sanitize_graph_group_id(row["group_id"]),
+            }
+            self.store.enqueue_outbox(
+                operation_id=str(uuid4()),
+                target_backend="graph",
+                record_id=str(row["id"]),
+                op_type="add_entity",
+                payload=payload,
+                dedupe_key=f"add_entity:{row['id']}:graph",
+                projector_version=self._runtime_config.projector_version,
+            )
+
+        for row in edges:
+            fact_text = row["fact_text"] or f"{row['source_id']} {row['relation_type']} {row['target_id']}"
+            payload = {
+                "id": row["id"],
+                "op_type": "add_fact",
+                "graph_name": f"fact_{row['id']}",
+                "episode_body": f"{fact_text} | {row['metadata_json'] or '{}'}",
+                "source_description": f"Fact: {row['relation_type']}",
+                "valid_at": row["valid_at"],
+            }
+            self.store.enqueue_outbox(
+                operation_id=str(uuid4()),
+                target_backend="graph",
+                record_id=str(row["id"]),
+                op_type="add_fact",
+                payload=payload,
+                dedupe_key=f"add_fact:{row['id']}:graph",
+                projector_version=self._runtime_config.projector_version,
+            )
+
+        self._submit_outbox_worker("graph")
+        return {
+            "available": True,
+            "affected": len(nodes) + len(edges),
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "dry_run": False,
+        }
+
     async def add_entity(
         self,
         name: str,
@@ -573,6 +1045,7 @@ class SemanticManager:
         confidence: float = 0.7,
         source_episode: Optional[str] = None,
         preprocess: bool = True,
+        group_id: Optional[str] = None,
     ) -> SynapseNode:
         """
         Add an entity to semantic memory.
@@ -589,8 +1062,6 @@ class SemanticManager:
         Returns:
             Created SynapseNode
         """
-        await self._ensure_graphiti()
-
         now = utcnow()
 
         # Preprocess name and summary for Thai
@@ -625,6 +1096,7 @@ class SemanticManager:
             created_at=now,
             updated_at=now,
             source_episode=source_episode,
+            chat_id=_sanitize_graph_group_id(group_id),
         )
 
         self.store.save_node(node)
@@ -655,6 +1127,7 @@ class SemanticManager:
                 "episode_body": f"{processed_name}: {processed_summary or ''}",
                 "source_description": f"Entity type: {entity_type.value}",
                 "created_at": now.isoformat(),
+                "group_id": node.chat_id,
             }
             self._queue_outbox("graph", node.id, "add_entity", graph_payload)
 
@@ -669,6 +1142,7 @@ class SemanticManager:
         valid_at: Optional[datetime] = None,
         source_episode: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        group_id: Optional[str] = None,
     ) -> SynapseEdge:
         """
         Add a fact (relationship) to semantic memory.
@@ -685,8 +1159,6 @@ class SemanticManager:
         Returns:
             Created SynapseEdge
         """
-        await self._ensure_graphiti()
-
         now = utcnow()
         edge_id = f"edge_{source_id}_{relation_type}_{target_id}"
 
@@ -712,6 +1184,7 @@ class SemanticManager:
                 "episode_body": f"{fact_text} | {metadata or {}}",
                 "source_description": f"Fact: {relation_type.value}",
                 "valid_at": (valid_at or now).isoformat(),
+                "group_id": _sanitize_graph_group_id(group_id),
             }
             self._queue_outbox("graph", edge.id, "add_fact", graph_payload)
 
@@ -806,10 +1279,11 @@ class SemanticManager:
             self._warn_vector_issue(exc)
 
         # Try to get from Graphiti if available
-        if self._graphiti is not None:
+        graphiti_client = self._bound_graphiti_client()
+        if graphiti_client is not None:
             try:
                 # Search for the entity in Graphiti
-                results = await self._graphiti.search(
+                results = await graphiti_client.search(
                     query=entity_id,
                     num_results=1,
                 )
@@ -853,44 +1327,56 @@ class SemanticManager:
         Returns:
             Created new SynapseEdge
         """
-        await self._ensure_graphiti()
-
         now = utcnow()
 
         # Mark old edge as invalid by adding a superseding fact
-        if self._graphiti is not None:
-            try:
-                # Add an episode marking the old fact as invalid
-                invalidation_content = f"Fact {old_edge_id} is no longer valid as of {now.isoformat()}"
-                await self._persist_graphiti_episode(
-                    name=f"invalidate_{old_edge_id}",
-                    episode_body=invalidation_content,
-                    source_description="Fact invalidation",
-                    reference_time=now,
-                )
-                logger.debug(f"Fact '{old_edge_id}' marked as invalid in Graphiti")
-            except Exception as e:
-                self._handle_graphiti_error("supersede_fact_invalidation", e, old_edge_id)
-        elif _REQUIRE_GRAPHITI:
-            raise GraphitiNotInitializedError("supersede_fact")
+        if self._graphiti is not None or _REQUIRE_GRAPHITI:
+            self._queue_outbox(
+                "graph",
+                old_edge_id,
+                "invalidate_fact",
+                {
+                    "id": old_edge_id,
+                    "op_type": "invalidate_fact",
+                    "graph_name": f"invalidate_{old_edge_id}",
+                    "episode_body": f"Fact {old_edge_id} is no longer valid as of {now.isoformat()}",
+                    "source_description": "Fact invalidation",
+                    "created_at": now.isoformat(),
+                },
+            )
 
         # Create new edge
         new_edge.valid_at = now
         new_edge.metadata["supersedes"] = old_edge_id
-
-        # Persist new edge to Graphiti
-        if self._graphiti is not None:
-            try:
-                episode_content = f"{new_edge.source_id} {new_edge.type.value} {new_edge.target_id}"
-                await self._persist_graphiti_episode(
-                    name=f"fact_{new_edge.id}",
-                    episode_body=episode_content,
-                    source_description=f"Superseding fact: {new_edge.type.value}",
-                    reference_time=now,
-                )
-                logger.debug(f"New fact '{new_edge.id}' persisted to Graphiti")
-            except Exception as e:
-                self._handle_graphiti_error("supersede_fact_new", e, new_edge.id)
+        self.store.save_edge(
+            new_edge,
+            fact_text=(
+                f"{new_edge.source_id} "
+                f"{new_edge.type.value if hasattr(new_edge.type, 'value') else new_edge.type} "
+                f"{new_edge.target_id}"
+            ),
+        )
+        if self._graphiti is not None or _REQUIRE_GRAPHITI:
+            self._queue_outbox(
+                "graph",
+                new_edge.id,
+                "graph_event",
+                {
+                    "id": new_edge.id,
+                    "op_type": "graph_event",
+                    "graph_name": f"fact_{new_edge.id}",
+                    "episode_body": (
+                        f"{new_edge.source_id} "
+                        f"{new_edge.type.value if hasattr(new_edge.type, 'value') else new_edge.type} "
+                        f"{new_edge.target_id}"
+                    ),
+                    "source_description": (
+                        "Superseding fact: "
+                        f"{new_edge.type.value if hasattr(new_edge.type, 'value') else new_edge.type}"
+                    ),
+                    "created_at": now.isoformat(),
+                },
+            )
 
         return new_edge
 
@@ -911,8 +1397,6 @@ class SemanticManager:
         Returns:
             Updated SynapseNode or None
         """
-        await self._ensure_graphiti()
-
         # Get existing entity from Qdrant
         node = await self.get_entity(entity_id)
         if node is None:
@@ -931,24 +1415,30 @@ class SemanticManager:
         node.updated_at = utcnow()
         node.access_count += 1
 
+        self.store.save_node(node)
+
         # Update in Qdrant
         self._index_entity(node)
 
         # Persist update to Graphiti
-        if self._graphiti is not None:
-            try:
-                episode_content = f"Updated {node.name}: {summary or ''}"
-                await self._persist_graphiti_episode(
-                    name=f"update_{entity_id}",
-                    episode_body=episode_content,
-                    source_description=f"Entity update: {node.type.value}",
-                    reference_time=node.updated_at,
-                )
-                logger.debug(f"Entity '{entity_id}' update persisted to Graphiti")
-            except Exception as e:
-                self._handle_graphiti_error("update_entity", e, entity_id)
-        elif _REQUIRE_GRAPHITI:
-            raise GraphitiNotInitializedError("update_entity")
+        if self._graphiti is not None or _REQUIRE_GRAPHITI:
+            self._queue_outbox(
+                "graph",
+                entity_id,
+                "update_entity",
+                {
+                    "id": entity_id,
+                    "op_type": "update_entity",
+                    "graph_name": f"update_{entity_id}",
+                    "episode_body": f"Updated {node.name}: {summary or ''}",
+                    "source_description": (
+                        "Entity update: "
+                        f"{node.type.value if hasattr(node.type, 'value') else node.type}"
+                    ),
+                    "created_at": node.updated_at.isoformat(),
+                    "group_id": node.chat_id,
+                },
+            )
 
         return node
 
@@ -1016,14 +1506,15 @@ class SemanticManager:
         related: List[SynapseNode] = []
 
         # Use Graphiti search for graph traversal
-        if self._graphiti is not None:
+        graphiti_client = self._bound_graphiti_client()
+        if graphiti_client is not None:
             try:
                 # Build query for related entities
                 query = f"related to {entity_id}"
                 if relation_types:
                     query += " " + " ".join(rt.value for rt in relation_types)
 
-                results = await self._graphiti.search(
+                results = await graphiti_client.search(
                     query=query,
                     num_results=limit * max_depth,
                 )

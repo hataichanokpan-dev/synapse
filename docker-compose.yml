@@ -68,6 +68,13 @@ services:
 
       # Graphiti Configuration
       - GRAPHITI_GROUP_ID=${GRAPHITI_GROUP_ID:-user-bfipa}
+      - GRAPH_CANONICAL_DATABASE=${GRAPH_CANONICAL_DATABASE:-${FALKORDB_DATABASE:-user-bfipa}}
+      - GRAPH_DEFAULT_GROUP_ID=${GRAPH_DEFAULT_GROUP_ID:-global}
+      - GRAPH_PROJECTION_MAX_INFLIGHT=${GRAPH_PROJECTION_MAX_INFLIGHT:-1}
+      - GRAPH_PROJECTION_MIN_INTERVAL_SECONDS=${GRAPH_PROJECTION_MIN_INTERVAL_SECONDS:-10}
+      - GRAPH_PROJECTION_COOLDOWN_SECONDS=${GRAPH_PROJECTION_COOLDOWN_SECONDS:-300}
+      - GRAPH_PROJECTION_MAX_RETRIES=${GRAPH_PROJECTION_MAX_RETRIES:-12}
+      - GRAPH_PROJECTION_LEASE_TIMEOUT_SECONDS=${GRAPH_PROJECTION_LEASE_TIMEOUT_SECONDS:-300}
       - USER_ID=${USER_ID:-cerberus}
 
       # Performance
@@ -110,7 +117,7 @@ services:
       - API_KEY=${SYNAPSE_API_KEY:-synapse-dev-key}
       - SYNAPSE_API_KEY=${SYNAPSE_API_KEY:-synapse-dev-key}
       - API_KEY_HEADER=${API_KEY_HEADER:-X-API-Key}
-      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,http://localhost:7533,http://127.0.0.1:7533}
       - DEBUG=${DEBUG:-false}
       - FALKORDB_HOST=falkordb
       - FALKORDB_PORT=6379
@@ -124,6 +131,13 @@ services:
       - EMBEDDER_PROVIDER=${EMBEDDER_PROVIDER:-openai}
       - USER_ID=${USER_ID:-cerberus}
       - FEED_BUFFER_SIZE=${FEED_BUFFER_SIZE:-500}
+      - GRAPH_CANONICAL_DATABASE=${GRAPH_CANONICAL_DATABASE:-${FALKORDB_DATABASE:-user-bfipa}}
+      - GRAPH_DEFAULT_GROUP_ID=${GRAPH_DEFAULT_GROUP_ID:-global}
+      - GRAPH_PROJECTION_MAX_INFLIGHT=${GRAPH_PROJECTION_MAX_INFLIGHT:-1}
+      - GRAPH_PROJECTION_MIN_INTERVAL_SECONDS=${GRAPH_PROJECTION_MIN_INTERVAL_SECONDS:-10}
+      - GRAPH_PROJECTION_COOLDOWN_SECONDS=${GRAPH_PROJECTION_COOLDOWN_SECONDS:-300}
+      - GRAPH_PROJECTION_MAX_RETRIES=${GRAPH_PROJECTION_MAX_RETRIES:-12}
+      - GRAPH_PROJECTION_LEASE_TIMEOUT_SECONDS=${GRAPH_PROJECTION_LEASE_TIMEOUT_SECONDS:-300}
 
       # UTF-8 Encoding (Thai language support)
       - PYTHONIOENCODING=utf-8
@@ -150,6 +164,33 @@ services:
           memory: 2G
         reservations:
           memory: 512M
+
+  synapse-ui:
+    build:
+      context: ./synapse-ui
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_API_KEY: ${SYNAPSE_API_KEY:-synapse-dev-key}
+    container_name: synapse-ui
+    ports:
+      - "${SYNAPSE_UI_PORT:-7533}:7533"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      - NEXT_PUBLIC_API_KEY=${SYNAPSE_API_KEY:-synapse-dev-key}
+      - NODE_ENV=production
+    depends_on:
+      synapse-api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - synapse-network
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
 
 networks:
   synapse-network:

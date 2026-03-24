@@ -1,12 +1,12 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo } from "react";
-import { Search, ZoomIn, ZoomOut, Maximize2, AlertCircle } from "lucide-react";
+import { Search, ZoomIn, ZoomOut, Maximize2, AlertCircle, RefreshCw } from "lucide-react";
 import { GraphCanvas } from "./graph-canvas";
-import { api } from "../../lib/api-client";
+import { api, type StatsResponse } from "../../lib/api-client";
 import type { GraphNode, GraphEdge, GraphData } from "../../lib/types/graph";
 import { GraphOfflineState, GraphSkeleton } from "@/components/ui/empty-states";
-import { formatDate } from "@/lib/utils";
+import { formatDate, formatRelativeTime } from "@/lib/utils";
 import clsx from "clsx";
 
 interface SelectedNode {
@@ -14,32 +14,129 @@ interface SelectedNode {
   connections: { edge: GraphEdge; neighbor: GraphNode }[];
 }
 
+interface GraphProjectionStatus {
+  pending_count?: number;
+  failed_count?: number;
+  due_count?: number;
+  dead_letter_count?: number;
+  leased_count?: number;
+  unhealthy?: boolean;
+  next_attempt_at?: string | null;
+  oldest_due_at?: string | null;
+  last_error_excerpt?: string | null;
+  circuit_state?: string;
+  cooldown_until?: string | null;
+  pause_reason?: string | null;
+  last_error_code?: string | null;
+  provider_last_429_at?: string | null;
+  last_projected_at?: string | null;
+}
+
 export function GraphView() {
   const [graphData, setGraphData] = useState<GraphData>({ nodes: [], edges: [] });
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedNode, setSelectedNode] = useState<SelectedNode | null>(null);
   const [zoom, setZoom] = useState(1);
+  const [projectionStatus, setProjectionStatus] = useState<GraphProjectionStatus | null>(null);
+  const [streamConnected, setStreamConnected] = useState(false);
+
+  const updateProjectionStatus = useCallback((stats: StatsResponse) => {
+    const graph = stats.search?.semantic_projection?.outbox?.graph;
+    setProjectionStatus((graph ?? null) as GraphProjectionStatus | null);
+  }, []);
 
   // Load graph data
-  const loadGraph = useCallback(async () => {
-    setIsLoading(true);
+  const loadGraph = useCallback(async (options?: { background?: boolean }) => {
+    const background = Boolean(options?.background);
+    if (!background) {
+      setIsLoading(true);
+    }
+    setIsRefreshing(background);
     setError(null);
 
     try {
-      const data = await api.getGraphData(100);
-      setGraphData(data);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to load graph";
-      setError(message);
+      const [graphResult, statsResult] = await Promise.allSettled([
+        api.getGraphData(100),
+        api.getStats(),
+      ]);
+
+      if (graphResult.status === "fulfilled") {
+        setGraphData(graphResult.value);
+      } else {
+        const message = graphResult.reason instanceof Error
+          ? graphResult.reason.message
+          : "Failed to load graph";
+        setError(message);
+      }
+
+      if (statsResult.status === "fulfilled") {
+        updateProjectionStatus(statsResult.value);
+      } else if (graphResult.status === "fulfilled") {
+        const message = statsResult.reason instanceof Error
+          ? statsResult.reason.message
+          : "Failed to load graph projection status";
+        setError(message);
+      }
     } finally {
       setIsLoading(false);
+      setIsRefreshing(false);
     }
-  }, []);
+  }, [updateProjectionStatus]);
 
   useEffect(() => {
-    loadGraph();
+    void loadGraph();
+  }, [loadGraph]);
+
+  useEffect(() => {
+    const stream = api.getFeedStream();
+
+    stream.onopen = () => {
+      setStreamConnected(true);
+    };
+
+    stream.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data) as { type?: string };
+        const eventType = payload?.type;
+        if (eventType === "connected" || eventType === "heartbeat") {
+          setStreamConnected(true);
+          return;
+        }
+        if (
+          eventType === "graph.projection.queued"
+          || eventType === "graph.projection.completed"
+          || eventType === "graph.projection.failed"
+          || eventType === "graph.circuit.open"
+          || eventType === "graph.circuit.closed"
+        ) {
+          void loadGraph({ background: true });
+        }
+      } catch {
+        setStreamConnected(false);
+      }
+    };
+
+    stream.onerror = () => {
+      setStreamConnected(false);
+    };
+
+    return () => {
+      setStreamConnected(false);
+      stream.close();
+    };
+  }, [loadGraph]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      void loadGraph({ background: true });
+    }, 30000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
   }, [loadGraph]);
 
   // Filter nodes by search
@@ -105,12 +202,56 @@ export function GraphView() {
   const handleZoomIn = () => setZoom((z) => Math.min(z * 1.2, 3));
   const handleZoomOut = () => setZoom((z) => Math.max(z / 1.2, 0.3));
   const handleZoomReset = () => setZoom(1);
+  const handleRefresh = () => void loadGraph({ background: true });
 
   // Determine state
   const safeNodes = Array.isArray(graphData.nodes) ? graphData.nodes : [];
   const showOffline = error && safeNodes.length === 0;
   const showLoading = isLoading && safeNodes.length === 0 && !error;
   const showEmpty = !isLoading && !error && safeNodes.length === 0;
+  const graphBadge = useMemo(() => {
+    const pending = projectionStatus?.pending_count ?? 0;
+    const failed = projectionStatus?.failed_count ?? 0;
+    const deadLetter = projectionStatus?.dead_letter_count ?? 0;
+    const due = projectionStatus?.due_count ?? 0;
+    const leased = projectionStatus?.leased_count ?? 0;
+    const circuitState = projectionStatus?.circuit_state ?? "unknown";
+
+    if (!projectionStatus) {
+      return {
+        label: "status unknown",
+        tone: "neutral",
+        detail: "Projection status unavailable",
+      };
+    }
+
+    if (projectionStatus.unhealthy || deadLetter > 0 || circuitState !== "closed") {
+      return {
+        label: "degraded",
+        tone: "warning",
+        detail:
+          projectionStatus.last_error_excerpt
+          || `pending ${pending}, failed ${failed}, dead-letter ${deadLetter}`,
+      };
+    }
+
+    if (pending > 0 || due > 0 || leased > 0) {
+      return {
+        label: "updating",
+        tone: "accent",
+        detail: `queued ${pending}, retrying ${failed}`,
+      };
+    }
+
+    return {
+      label: "caught up",
+      tone: "success",
+      detail:
+        projectionStatus.last_projected_at
+        ? `Last projected ${formatRelativeTime(projectionStatus.last_projected_at)}`
+        : "Projection queue is empty",
+    };
+  }, [projectionStatus]);
 
   return (
     <div className="h-full flex">
@@ -119,10 +260,29 @@ export function GraphView() {
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-border">
           <div className="flex items-center gap-3">
-            <h2 className="text-sm font-medium text-text-primary">Knowledge Graph</h2>
-            <span className="text-[11px] text-text-muted">
-              {filteredData.nodes.length} nodes / {filteredData.edges.length} edges
-            </span>
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-sm font-medium text-text-primary">Knowledge Graph</h2>
+                <span
+                  className={clsx(
+                    "px-2 py-0.5 text-[10px] rounded-full uppercase tracking-wide",
+                    graphBadge.tone === "success" && "bg-success/15 text-success",
+                    graphBadge.tone === "accent" && "bg-accent/15 text-accent",
+                    graphBadge.tone === "warning" && "bg-warning/15 text-warning",
+                    graphBadge.tone === "neutral" && "bg-bg-tertiary text-text-muted"
+                  )}
+                >
+                  {graphBadge.label}
+                </span>
+              </div>
+              <div className="flex items-center gap-2 text-[11px] text-text-muted">
+                <span>
+                  {filteredData.nodes.length} nodes / {filteredData.edges.length} edges
+                </span>
+                <span className="hidden sm:inline">•</span>
+                <span className="hidden sm:inline">{graphBadge.detail}</span>
+              </div>
+            </div>
           </div>
 
           {/* Search */}
@@ -144,6 +304,14 @@ export function GraphView() {
 
           {/* Zoom controls */}
           <div className="flex items-center gap-1">
+            <button
+              onClick={handleRefresh}
+              disabled={isRefreshing || isLoading}
+              className="p-1.5 text-text-secondary hover:text-text-primary transition-colors disabled:opacity-50"
+              title="Refresh graph"
+            >
+              <RefreshCw size={16} className={clsx((isRefreshing || isLoading) && "animate-spin")} />
+            </button>
             <button
               onClick={handleZoomOut}
               className="p-1.5 text-text-secondary hover:text-text-primary transition-colors"
@@ -190,6 +358,20 @@ export function GraphView() {
           </div>
         ) : (
           <>
+            {graphBadge.label === "degraded" && projectionStatus && (
+              <div className="px-4 py-2 bg-warning/10 border-b border-warning/20 flex items-center gap-2 text-warning text-xs">
+                <AlertCircle size={14} />
+                <span>
+                  Graph may be stale.
+                  {projectionStatus.next_attempt_at
+                    ? ` Next retry ${formatRelativeTime(projectionStatus.next_attempt_at)}.`
+                    : ""}
+                  {projectionStatus.last_error_excerpt
+                    ? ` ${projectionStatus.last_error_excerpt}`
+                    : ""}
+                </span>
+              </div>
+            )}
             {/* Error banner - non-blocking */}
             {error && (
               <div className="px-4 py-2 bg-warning/10 border-b border-warning/20 flex items-center gap-2 text-warning text-xs">
