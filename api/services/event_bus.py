@@ -6,31 +6,14 @@ Provides in-memory event publishing and SSE streaming for the feed system.
 
 import asyncio
 from collections import deque
-from enum import Enum
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-
-class FeedEventType(str, Enum):
-    """Types of feed events."""
-
-    MEMORY_ADD = "memory.add"
-    MEMORY_DELETE = "memory.delete"
-    MEMORY_SEARCH = "memory.search"
-    MEMORY_DECAY = "memory.decay"
-    PROCEDURE_ADD = "procedure.add"
-    PROCEDURE_SUCCESS = "procedure.success"
-    IDENTITY_CHANGE = "identity.change"
-    CONSOLIDATION = "consolidation"
-    MAINTENANCE = "maintenance"
-    SYSTEM_ERROR = "system.error"
-    GRAPH_PROJECTION_QUEUED = "graph.projection.queued"
-    GRAPH_PROJECTION_COMPLETED = "graph.projection.completed"
-    GRAPH_PROJECTION_FAILED = "graph.projection.failed"
-    GRAPH_CIRCUIT_OPEN = "graph.circuit.open"
-    GRAPH_CIRCUIT_CLOSED = "graph.circuit.closed"
+# FeedEventType is defined in the synapse core package so that synapse.layers
+# and synapse.services can import it without depending on this api module.
+from synapse.events import FeedEventType  # re-exported for api consumers
 
 
 class FeedEvent(BaseModel):

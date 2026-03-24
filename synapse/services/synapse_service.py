@@ -14,7 +14,7 @@ from datetime import datetime as dt
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from api.services.event_bus import FeedEventType
+from synapse.events import FeedEventType
 from synapse.graph_runtime import (
     bind_graph_driver,
     bind_graphiti_client,
@@ -619,8 +619,19 @@ class SynapseService:
         # Step 3: Graph projection is always asynchronous via the projector queue.
         graphiti_result = None
         if persist_graphiti:
+            # Enqueue raw episode for graph projection via SemanticManager
+            # This ensures rate limiting and retries are handled correctly.
+            op_id = self.layers.semantic.enqueue_graph_episode(
+                name=name,
+                episode_body=episode_body,
+                source_description=source_description,
+                reference_time=_coerce_datetime(reference_time),
+                group_id=group_id,
+            )
+
             graphiti_result = {
-                "queued": bool(self.graphiti is not None or os.getenv("SYNAPSE_REQUIRE_GRAPHITI", "false").lower() == "true"),
+                "queued": True,
+                "operation_id": op_id,
                 "mode": "projector",
                 "group_id": _sanitize_graph_group_id(group_id),
                 "reference_time": (_coerce_datetime(reference_time) or datetime.now(timezone.utc)).isoformat(),

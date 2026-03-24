@@ -28,7 +28,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 from uuid import uuid4
 
-from api.services.event_bus import FeedEventType
+from synapse.events import FeedEventType
 from synapse.graph_runtime import (
     bind_graphiti_client,
     load_graph_projection_runtime_config,
@@ -624,9 +624,28 @@ class SemanticManager:
         """Run Graphiti work on the app loop when available."""
         app_loop = self._app_loop
         if app_loop is not None and not app_loop.is_closed():
-            future = asyncio.run_coroutine_threadsafe(coro, app_loop)
-            future.result(timeout=60)
-            return
+            try:
+                # Check if we are already running in the app_loop to avoid deadlock
+                current_loop = None
+                try:
+                    current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+
+                if current_loop == app_loop:
+                    # We are in the loop, we can't block. 
+                    # This is rare for outbox workers but happens in synchronous test calls.
+                    # We'll try to run it immediately if possible, but outbox is designed
+                    # for background threads. For now, we use a task if in loop.
+                    asyncio.create_task(coro)
+                    return
+
+                future = asyncio.run_coroutine_threadsafe(coro, app_loop)
+                future.result(timeout=60)
+                return
+            except Exception as e:
+                logger.error(f"Error running graph coroutine: {e}")
+                raise
 
         try:
             asyncio.run(coro)
@@ -1035,6 +1054,62 @@ class SemanticManager:
             "edges": len(edges),
             "dry_run": False,
         }
+
+    def enqueue_graph_episode(
+        self,
+        name: str,
+        episode_body: str,
+        source_description: str = "episode",
+        reference_time: Optional[datetime] = None,
+        group_id: Optional[str] = None,
+    ) -> str:
+        """
+        Enqueue a raw episode for graph projection.
+
+        Args:
+            name: Episode name
+            episode_body: Content to store
+            source_description: Description of source
+            reference_time: Optional timestamp
+            group_id: Optional group ID for isolation
+
+        Returns:
+            Operation ID
+        """
+        operation_id = str(uuid4())
+        record_id = f"episode_{operation_id[:8]}"
+        payload = {
+            "op_type": "graph_event",
+            "graph_name": name,
+            "episode_body": episode_body,
+            "source_description": source_description,
+            "created_at": (reference_time or utcnow()).isoformat(),
+            "group_id": _sanitize_graph_group_id(group_id),
+        }
+
+        self.store.enqueue_outbox(
+            operation_id=operation_id,
+            target_backend="graph",
+            record_id=record_id,
+            op_type="graph_event",
+            payload=payload,
+            dedupe_key=f"graph_event:{operation_id}:graph",
+            projector_version=self._runtime_config.projector_version,
+        )
+
+        self._emit_projection_event(
+            FeedEventType.GRAPH_PROJECTION_QUEUED,
+            summary=f"Graph episode queued: {name}",
+            detail={
+                "backend": "graph",
+                "operation_id": operation_id,
+                "record_id": record_id,
+                "op_type": "graph_event",
+            },
+        )
+
+        self._submit_outbox_worker("graph")
+        return operation_id
 
     async def add_entity(
         self,
